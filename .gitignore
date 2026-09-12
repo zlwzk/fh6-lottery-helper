@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 运行时生成的资源（脚本可重新生成）
+assets/app.ico
+assets/app.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
