@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,10 @@ STATE_ROLES = ("result_owned", "result_new", "sell", "confirm", "end")
 START_GUARD_S = 0.6          # 按下「开始抽奖」后的起步保护时间
 REPEAT_GAP_S = 2.5           # 同一静态画面被重复识别时的重试间隔
 FAIL_FRAME_KEEP = 30         # 失败现场截图最多保留张数
+HIGHLIGHT_MIN_AREA = 600     # 「本次抽中」的高亮格至少要有这么多像素才算数
+HIGHLIGHT_MAX_RATIO = 0.45   # 占框选面积超过这个比例的连通块是背景，不是某一格
+REWARD_TEXT_MAX = 48         # 奖励文本在界面与日志里的最大长度
+REWARD_LIST_KEEP = 400       # 奖励流水最多留多少条
 
 
 class EngineState(str, Enum):
@@ -45,10 +50,14 @@ class Stats:
     owned: int = 0
     new_cars: int = 0
     sells: int = 0
-    credits: int = 0
+    credits: int = 0             # 出售车辆换来 CR
+    cash_credits: int = 0        # 抽奖直接抽到的 CR
+    cash_hits: int = 0           # 抽到 CR 的次数
+    car_wins: int = 0            # 抽到车（新车 + 重复）的次数
     loops: int = 0
     actions: int = 0
     prices: list[int] = field(default_factory=list)
+    rewards: list[str] = field(default_factory=list)   # 奖励流水（最近若干条）
     remaining: int | None = None
     started_at: float = 0.0
     ended_at: float = 0.0
@@ -56,6 +65,8 @@ class Stats:
     last_state: str = "待机"
     last_source: str = ""
     last_score: float = 0.0
+    last_reward: str = ""
+    last_reward_kind: str = ""   # cash | car | unknown
     unknown_streak: int = 0
 
     def elapsed(self) -> float:
@@ -63,6 +74,18 @@ class Stats:
             return 0.0
         end = self.ended_at or time.time()
         return max(0.0, end - self.started_at)
+
+    def elapsed_text(self) -> str:
+        """把耗时格式化成 时:分:秒 / 分:秒，给界面和结束摘要用。"""
+        total = int(self.elapsed())
+        hours, rest = divmod(total, 3600)
+        minutes, seconds = divmod(rest, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def total_credits(self) -> int:
+        return int(self.credits) + int(self.cash_credits)
 
     def rate_per_min(self) -> float:
         elapsed = self.elapsed()
@@ -148,9 +171,12 @@ class LotteryEngine:
         self._cooldown_until = 0.0
         self._waiting_result_until = 0.0
         self._last_ocr_at = 0.0
+        self._last_count_at = 0.0
         self._handled_sig = ""
         self._handled_at = 0.0       # 上次对 _handled_sig 这个画面动作的时间（重复画面重试节流用）
         self._stuck_since = 0.0      # 当前静态画面开始「一直没变」的时间（卡住保护用）
+        self._reward_read_for = -1   # 已经读过奖励的「抽奖序号」，同一次抽奖只记一次账
+        self._price_read_for = -1    # 已经读过出售价的「抽奖序号」，避免同一次卖车被记两遍
         self._foreground_warn_at = 0.0
         self._exit_reason = ""
 
@@ -184,6 +210,8 @@ class LotteryEngine:
         self._handled_sig = ""
         self._handled_at = 0.0
         self._stuck_since = 0.0
+        self._reward_read_for = -1
+        self._price_read_for = -1
         self._exit_reason = ""
         self._refresh_roles()
         self._set_state(EngineState.RUNNING)
@@ -310,8 +338,22 @@ class LotteryEngine:
         self._emit_stats()
         self._set_state(EngineState.FINISHED)
         self._log("info", f"结束：{reason}")
+        self._log("info", self.summary_line())
         self.signals.finished.emit(reason, self.stats.clone())
         capture.close_all()
+
+    def summary_line(self) -> str:
+        """收工小结：抽了多少次、花了多久、一共到手多少 CR。"""
+        stats = self.stats
+        parts = [f"共抽奖 {stats.spins_started} 次，总耗时 {stats.elapsed_text()}"]
+        if stats.car_wins:
+            parts.append(f"抽到车辆 {stats.car_wins} 辆")
+        if stats.cash_credits:
+            parts.append(f"抽到 CR {stats.cash_credits:,}（{stats.cash_hits} 次）")
+        if stats.sells:
+            parts.append(f"卖出 {stats.sells} 台共 {stats.credits:,} CR")
+        parts.append(f"合计收益 {stats.total_credits():,} CR")
+        return "；".join(parts)
 
     # ---------------- 节奏宏 ----------------
     def _run_rhythm(self) -> None:
@@ -421,6 +463,11 @@ class LotteryEngine:
         if not self._ocr.ready:
             self._log("warn", "OCR 引擎未就绪，关键词识别不可用（模板匹配仍可工作）")
 
+        # 一整轮就四件事，顺序固定：
+        #   1) 截屏          2) 识别现在停在哪个界面
+        #   3) 顺手把画面上的数字读出来记账（抽到多少 CR / 还剩几次）
+        #   4) 按识别到的界面决定按什么键
+        # 不假设游戏的固定流程，每一步都由「这一刻画面长什么样」决定。
         while not self._stop_flag.is_set():
             self._wait_while_paused()
             if self._stop_flag.is_set():
@@ -430,6 +477,7 @@ class LotteryEngine:
                 self._exit_reason = "鼠标急停触发（把鼠标移到屏幕左上角即停止）"
                 return
 
+            # ---- 1) 看屏幕 ----
             frame = capture.grab_window(hwnd)
             if frame is None:
                 self._log("warn", "截图失败：游戏窗口可能已最小化或被关闭")
@@ -439,6 +487,7 @@ class LotteryEngine:
                 self._sleep_cancellable(0.5)
                 continue
 
+            # ---- 2) 认清当前界面 ----
             info = self._recognize(frame, ocr_interval)
             now = time.time()
             if now >= self._last_preview_emit + 0.15:
@@ -451,9 +500,17 @@ class LotteryEngine:
             self.stats.last_source = info.source
             self.stats.last_score = info.score
 
+            # ---- 3) 顺手读数记账 ----
+            self._harvest(info, frame, smart)
+
+            # ---- 4) 动手 ----
             sig = matcher.signature(frame.image)
             acted = self._dispatch(info, frame, sig, smart, owned_policy, owned_keys,
                                    start_key, input_mode, hwnd)
+
+            if self.stats.remaining == 0:
+                self._exit_reason = "游戏内抽奖次数已为 0，收工"
+                return
 
             if target and self.stats.spins_started >= target:
                 self._exit_reason = f"已完成设定的 {target} 次抽奖"
@@ -482,19 +539,30 @@ class LotteryEngine:
             else:
                 self.stats.unknown_streak = 0
 
-            # 读取剩余的抽奖次数（低频）
-            if smart.get("spin_count_rule", {}).get("enabled") and self._ocr.ready:
-                if now - self._last_ocr_at >= max(1.0, ocr_interval * 2):
-                    self._read_spin_count(frame)
-                    if self.stats.remaining == 0:
-                        self._exit_reason = "游戏内抽奖次数已为 0"
-                        return
-
             self._emit_stats()
             if not acted:
                 self._sleep_cancellable(poll)
         if not self._exit_reason:
             self._exit_reason = "手动停止"
+
+    # ---------------- 读数记账 ----------------
+    def _harvest(self, info: RecogInfo, frame: capture.Frame, smart: dict) -> None:
+        """只做「读数和记账」，不按键 —— 按键统一交给 _dispatch。
+
+        1) 本次抽到了什么：奖励面板上只有一格会高亮，读那一格的文字；
+        2) 游戏内还剩几次：滚轮数字，低频读一次。
+        """
+        if not self._ocr.ready:
+            return
+        if info.role in ("result_new", "result_owned"):
+            # 这两个界面一出现就说明结果已经揭晓了，先读一手
+            self._read_reward(frame, smart)
+        rule = smart.get("spin_count_rule") or {}
+        if rule.get("enabled"):
+            interval = max(1.0, int(smart.get("ocr_interval_ms", 900)) / 1000.0 * 2)
+            if time.time() - self._last_count_at >= interval:
+                self._last_count_at = time.time()
+                self._read_spin_count(frame)
 
     # ------------------------------------------------------------------ #
     # 识别
@@ -564,6 +632,7 @@ class LotteryEngine:
         return np.ascontiguousarray(image[y0:y1, x0:x1])
 
     def _read_spin_count(self, frame: capture.Frame) -> None:
+        """读游戏里的「剩余抽奖机会」。"""
         smart = self.cfg.get("smart", {}) or {}
         rule = smart.get("spin_count_rule") or {}
         crop = self._crop(frame.image, rule.get("region"))
@@ -571,19 +640,234 @@ class LotteryEngine:
             return
         text = self._ocr.recognize(crop, str(rule.get("lang") or "zh-Hans-CN"),
                                    float(rule.get("scale") or 2.0))
-        value = ocr_mod.first_int(text, str(rule.get("regex") or r"\d+"))
-        if value is None:
+        if not text:
             return
+        numbers = [int(n) for n in re.findall(r"\d{1,7}", text)]
+        if not numbers:
+            return
+        pick = str(rule.get("pick") or "max")
+        if pick == "min":
+            value = min(numbers)
+        elif pick == "first":
+            value = numbers[0]
+        else:
+            # 剩余次数是个滚动数字，一屏可能同时看到 997 / 998 / 999。
+            # 取最大的那个最安全：顶多多抽一次，不会提前停下。
+            value = max(numbers)
         if value != self.stats.remaining:
             self._log("info", f"游戏内剩余抽奖次数：{value}")
         self.stats.remaining = value
 
+    def _read_reward(self, frame: capture.Frame, smart: dict) -> None:
+        """读出「本次抽中的那一格」，把抽到的 CR 或车记进统计。
+
+        抽奖结果画面上只有一格会被画成高亮（白底），其余格子都是彩色。
+        所以先在高亮格上定位，再只对那一小块做 OCR —— 既准又快。
+        """
+        rule = smart.get("reward_rule") or {}
+        if not rule.get("enabled"):
+            return
+        # 一次抽奖只记一次账：结果画面会停留好几秒，重复读会把同一份奖励算成好几份
+        if self._reward_read_for == self.stats.spins_started:
+            return
+        region = rule.get("region")
+        if not region:
+            return
+        # 转盘是一列一列停的，每一列各中一格（Super Wheelspin 一次给三份），
+        # 所以要把所有高亮格都读出来再汇总，不能只看最大的那一块。
+        crops = self._reward_crops(frame.image, region, str(rule.get("highlight") or "bright"))
+        if not crops:
+            return
+        lang = str(rule.get("lang") or "en-US")
+        scale = float(rule.get("scale") or 2.0)
+        min_digits = int(rule.get("min_digits", 3) or 3)
+        cash_total = 0
+        cash_cells = 0
+        car_names: list[str] = []
+        for crop in crops:
+            text = self._ocr.recognize(crop, lang, scale)
+            if text is None:
+                return      # 这次 OCR 抽风了，先不算数，下一轮重试
+            kind, value, label = self._parse_reward(text, min_digits)
+            if kind == "cash":
+                cash_total += value
+                cash_cells += 1
+            else:
+                # 转盘上的格子不是钱就是车：读不出内容的多半是纯车图那一格，也算车
+                car_names.append(label)
+        # 能读到画面本身就算「这一次读过了」，之后画面不动也不会重复计数
+        self._reward_read_for = self.stats.spins_started
+        index = self.stats.spins_started
+        if cash_total:
+            self.stats.cash_hits += 1
+            self.stats.last_reward_kind = "cash"
+            self.stats.last_reward = f"{cash_total:,} CR"
+            if rule.get("count_cash", True):
+                self.stats.cash_credits += cash_total
+            self._push_reward(f"{cash_total:,} CR")
+            self._log("info", f"第 {index} 次抽奖 → 这轮 {cash_cells} 份奖励共 {cash_total:,} CR"
+                              f"（抽奖所得累计 {self.stats.cash_credits:,} CR）")
+        car_count = len(crops) - cash_cells
+        if car_count > 0:
+            self._note_cars(index, car_names, car_count)
+
+    def probe_reward(self) -> tuple[str, int, str]:
+        """按当前设置试读一次「本次抽到的奖励」，只报结果不记账（给设置页的测试按钮用）。"""
+        if not self._ocr.ready:
+            self._log("warn", f"OCR 引擎还没就绪：{self._ocr.error or '未知原因'}")
+            return "unknown", 0, ""
+        smart = self.cfg.get("smart", {}) or {}
+        rule = smart.get("reward_rule") or {}
+        region = rule.get("region")
+        if not region:
+            self._log("warn", "还没框选「奖励面板」区域，没法测试")
+            return "unknown", 0, ""
+        hwnd = int(self.cfg.get("window.hwnd", 0) or 0)
+        frame = capture.grab_window(hwnd)
+        if frame is None:
+            self._log("warn", "截图失败：先把游戏窗口打开、别最小化")
+            return "unknown", 0, ""
+        crops = self._reward_crops(frame.image, region, str(rule.get("highlight") or "bright"))
+        if not crops:
+            self._log("warn", "框选区域里没找到高亮格：确认游戏正停在抽奖结果界面（转盘已经停下），"
+                              "或者把框选范围放大到整块奖励面板")
+            return "unknown", 0, ""
+        lang = str(rule.get("lang") or "en-US")
+        scale = float(rule.get("scale") or 2.0)
+        min_digits = int(rule.get("min_digits", 3) or 3)
+        cash_total, cash_cells, names = 0, 0, []
+        for order, crop in enumerate(crops, 1):
+            text = self._ocr.recognize(crop, lang, scale)
+            if text is None:
+                self._log("warn", f"第 {order} 格 OCR 没返回结果，跳过")
+                continue
+            raw = text.strip()[:60]
+            if not raw:
+                self._log("info", f"第 {order} 格：没读到文字（应该是纯车图那一格）→ 算车")
+                names.append("")
+                continue
+            kind, value, label = self._parse_reward(text, min_digits)
+            if kind == "cash":
+                cash_total += value
+                cash_cells += 1
+                self._log("info", f"第 {order} 格：{value:,} CR（原始文本：{raw!r}）")
+            else:
+                names.append(label)
+                self._log("info", f"第 {order} 格：车辆「{label}」（原始文本：{raw!r}）")
+        if not cash_total and not names:
+            self._log("warn", "高亮格都读不出内容：换个「高亮格的样子」选项再试，"
+                              "或把框选范围调大一点")
+            return "unknown", 0, ""
+        parts = []
+        if cash_cells:
+            parts.append(f"{cash_cells} 份 CR 共 {cash_total:,}")
+        if names:
+            parts.append(f"{len(names)} 辆车")
+        self._log("info", f"测试汇总：找到 {len(crops)} 个高亮格 → " + "，".join(parts))
+        kind = "car" if names else "cash"
+        return kind, cash_total, (names[0] if names else "")
+
+    def _note_cars(self, index: int, names: list[str], count: int) -> None:
+        named = [n for n in names if n]
+        self.stats.car_wins += count
+        self.stats.last_reward_kind = "car"
+        self.stats.last_reward = named[0] if named else "车辆"
+        self._push_reward("车：" + ("、".join(named) if named else "未知车辆"))
+        shown = "、".join(named) if named else "名字没读清"
+        self._log("info", f"第 {index} 次抽奖 → 这轮抽到 {count} 辆车（{shown}），"
+                          "接着按「已拥有车辆」的策略处理")
+
+    def _push_reward(self, text: str) -> None:
+        self.stats.rewards.append(text)
+        if len(self.stats.rewards) > REWARD_LIST_KEEP:
+            del self.stats.rewards[:-REWARD_LIST_KEEP]
+
+    def _reward_crops(self, image: np.ndarray, region, mode: str) -> list[np.ndarray]:
+        """找出奖励面板上所有「本次抽中的高亮格」，从左到右返回切好的小图。
+
+        转盘是一列一列停的，每一列各中一格（Super Wheelspin 一次给三份），
+        所以这里返回的是一组格子而不是单个。
+        判定办法：以整块面板的中位亮度作基准，明显更亮（或更暗）且面积够大的
+        连通块就是中奖格；一个都找不到，说明这一刻结果还没揭晓，就什么都不做。
+        """
+        panel = self._crop(image, region)
+        if panel is None or panel.size == 0:
+            return []
+        if mode == "none":
+            return [panel]
+        try:
+            import cv2
+        except Exception:
+            return []
+        gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+        base = float(np.median(gray))
+        if mode == "dark":
+            mask = np.where(gray < base - 40.0, 255, 0).astype(np.uint8)
+        else:
+            mask = np.where(gray > max(170.0, base + 40.0), 255, 0).astype(np.uint8)
+        kernel = np.ones((7, 7), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        panel_area = float(panel.shape[0] * panel.shape[1])
+        boxes = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < HIGHLIGHT_MIN_AREA:
+                continue
+            if area > panel_area * HIGHLIGHT_MAX_RATIO:
+                continue      # 快占满整块了，那是背景，不是某一格
+            boxes.append(cv2.boundingRect(contour))
+        if not boxes:
+            return []
+        boxes.sort(key=lambda box: box[0])       # 从左到右，日志读起来和画面顺序一致
+        crops = []
+        pad = 4
+        for x, y, w, h in boxes:
+            x0, y0 = max(0, x - pad), max(0, y - pad)
+            x1 = min(panel.shape[1], x + w + pad)
+            y1 = min(panel.shape[0], y + h + pad)
+            crops.append(np.ascontiguousarray(panel[y0:y1, x0:x1]))
+        return crops
+
+    @staticmethod
+    def _parse_reward(text: str, min_digits: int = 3) -> tuple[str, int, str]:
+        """把高亮格里的文字解析成 (类型, 金额, 显示名)。
+
+        类型：cash 抽到钱 / car 抽到车 / unknown 认不出。
+        格子内容要么是「CR 25,000」，要么是车名（「2021 迈凯伦 620R」），
+        要么干脆只有一张车图没有文字。
+        """
+        flat = " ".join((text or "").replace("\u00a0", " ").split())
+        if not flat:
+            return "unknown", 0, ""
+        value = 0
+        found = re.search(r"\d[\d,\.]*", flat)
+        if found:
+            digits = re.sub(r"[^\d]", "", found.group(0))
+            if len(digits) >= max(1, int(min_digits)):
+                value = int(digits)
+        # 把 CR / Credits 这类货币记号抹掉，剩下的如果还有字符，那就是车名（含中文/型号）
+        noise = re.sub(r"(?i)cr(edits?)?", " ", flat)
+        noise = re.sub(r"[\d,\.\s，、:：%\-—]", "", noise).strip()
+        if noise:
+            return "car", 0, flat[:REWARD_TEXT_MAX]
+        if value:
+            return "cash", value, f"{value:,} CR"
+        return "unknown", 0, flat[:REWARD_TEXT_MAX]
+
     def _read_sell_price(self, frame: capture.Frame) -> bool:
-        """读出售价并计入统计；返回是否读到了数字。"""
+        """读出售价并计入统计；返回是否读到了数字。
+
+        价格就写在那行选项里（「出售价格：975,000」），所以这个界面一出现就该读，
+        不用等某个单独的确认界面。同一次抽奖只记一次账，避免重复计数。
+        """
         smart = self.cfg.get("smart", {}) or {}
         rule = smart.get("sell_price_rule") or {}
         if not rule.get("enabled"):
             return False
+        if self._price_read_for == self.stats.spins_started:
+            return True      # 这一次已经记过账了
         crop = self._crop(frame.image, rule.get("region"))
         if crop is None:
             return False
@@ -593,13 +877,17 @@ class LotteryEngine:
         if value is None:
             self._log("warn", f"价格识别失败（原始文本：{(text or '').strip()[:60]!r}）")
             return False
+        self._price_read_for = self.stats.spins_started
+        self._note_sale(value)
+        return True
+
+    def _note_sale(self, value: int) -> None:
         self.stats.sells += 1
         self.stats.prices.append(value)
         if len(self.stats.prices) > 500:
             del self.stats.prices[:-500]
         self.stats.credits += value
-        self._log("info", f"出售价格：{value:,}（累计 {self.stats.credits:,}）")
-        return True
+        self._log("info", f"出售车辆：{value:,} CR（出售所得累计 {self.stats.credits:,} CR）")
 
     # ------------------------------------------------------------------ #
     # 失败现场
@@ -640,6 +928,12 @@ class LotteryEngine:
     def _dispatch(self, info: RecogInfo, frame: capture.Frame, sig: str, smart: dict,
                   owned_policy: str, owned_keys: list, start_key: str,
                   input_mode: str, hwnd: int) -> bool:
+        """按「这一刻画面停在哪个界面」决定按什么键。
+
+        顺序不是写死的流程，而是「认清界面 → 交给对应的处理函数」：
+        每处理完一个界面，下一轮重新看画面再判断，所以中途多出一步确认、
+        游戏卡一下、界面认错又恢复，都能自然接上。
+        """
         now = time.time()
         role = info.role
         if role == "unknown":
@@ -671,41 +965,65 @@ class LotteryEngine:
         }
 
         if role == "ready":
-            self._press([start_key], input_mode, hwnd, "按下开始抽奖")
-            self.stats.spins_started += 1
-            self.stats.last_action = f"开始抽奖（第 {self.stats.spins_started} 次）"
-            # 不再死等固定的 after_start_ms：只做一小段起步保护，
-            # 之后一识别到结果界面就立刻接手（低配机不会误判，高配机不用白等）
-            self._cooldown_until = now + START_GUARD_S
-            self._waiting_result_until = now + waits["after_start_ms"] / 1000.0
-            self._handled_sig = sig
-            self._handled_at = now
-            return True
-
+            return self._act_ready(frame, sig, now, smart, start_key, input_mode, hwnd, waits)
         if role == "result_new":
-            self._press(["enter"], input_mode, hwnd, "领取新车")
-            self.stats.results += 1
-            self.stats.new_cars += 1
-            self._cooldown_until = now + waits["after_result_ms"] / 1000.0
-            self._handled_sig = sig
-            self._handled_at = now
-            return True
-
+            return self._act_result_new(sig, now, input_mode, hwnd, waits)
         if role == "result_owned":
-            self.stats.results += 1
-            self.stats.owned += 1
-            keys = list(owned_keys) or ["enter"]
-            label = {"garage": "加入车库", "gift": "送礼", "sell": "出售"}.get(owned_policy, owned_policy)
-            self._press(keys, input_mode, hwnd, f"处理已拥有车辆 → {label}")
-            if owned_policy == "sell":
-                self._cooldown_until = now + waits["after_option_ms"] / 1000.0
-            else:
-                self._cooldown_until = now + waits["after_result_ms"] / 1000.0
-            self._handled_sig = sig
-            self._handled_at = now
-            return True
-
+            return self._act_owned(frame, sig, now, smart, owned_policy, owned_keys,
+                                   input_mode, hwnd, waits)
         if role == "sell":
+            return self._act_sell(frame, sig, now, smart, input_mode, hwnd, waits)
+        if role == "confirm":
+            return self._act_confirm(sig, now, input_mode, hwnd, waits)
+        if role == "end":
+            return self._act_end(smart)
+        if role == "blocked":
+            return self._act_blocked(sig, now, smart, input_mode, hwnd, waits)
+        return False
+
+    # 下面每个函数只负责「这一个界面上该做的事」，互不干涉。
+    # 抽奖界面（含结果页底部的「领取奖励并再次抽奖」）→ 继续下一次
+    def _act_ready(self, frame, sig, now, smart, start_key, input_mode, hwnd, waits) -> bool:
+        remaining = self.stats.remaining
+        hint = f"，游戏内还剩 {remaining} 次" if isinstance(remaining, int) else ""
+        # 正要按 Enter「领取奖励并再次抽奖」的这一瞬间，画面是停住的，
+        # 正是读「这一次抽到了什么」最稳的时候；读完再按，顺序才不会错。
+        # 第一次进来还没抽过，不用读。
+        if self.stats.spins_started >= 1:
+            self._read_reward(frame, smart)
+        self._press([start_key], input_mode, hwnd,
+                    f"开始抽奖（第 {self.stats.spins_started + 1} 次）{hint}")
+        self.stats.spins_started += 1
+        self.stats.last_action = f"第 {self.stats.spins_started} 次抽奖"
+        # 不再死等固定的 after_start_ms：只做一小段起步保护，
+        # 之后一识别到结果界面就立刻接手（低配机不会误判，高配机不用白等）
+        self._cooldown_until = now + START_GUARD_S
+        self._waiting_result_until = now + waits["after_start_ms"] / 1000.0
+        self._handled_sig = sig
+        self._handled_at = now
+        return True
+
+    def _act_result_new(self, sig, now, input_mode, hwnd, waits) -> bool:
+        """抽到新车 → 收下继续。"""
+        self._press(["enter"], input_mode, hwnd, "抽到新车 → 领取")
+        self.stats.results += 1
+        self.stats.new_cars += 1
+        self._cooldown_until = now + waits["after_result_ms"] / 1000.0
+        self._handled_sig = sig
+        self._handled_at = now
+        return True
+
+    def _act_owned(self, frame, sig, now, smart, owned_policy, owned_keys,
+                   input_mode, hwnd, waits) -> bool:
+        """抽到重复车：「添加至车库 / 送礼 / 出售」三选一。
+
+        策略是提前设定好的，之后每台重复车都照这个来。
+        选出售时，价格就写在选项那一行（「出售价格：975,000」），
+        所以趁这个界面还在赶紧读出来记账，不用等后面的确认界面。
+        """
+        self.stats.results += 1
+        self.stats.owned += 1
+        if owned_policy == "sell":
             rule = smart.get("sell_price_rule") or {}
             priced = self._read_sell_price(frame)
             if rule.get("enabled") and rule.get("abort_on_fail") and not priced:
@@ -714,42 +1032,64 @@ class LotteryEngine:
                 self._exit_reason = "出售价格没识别出来，已停止（避免误判界面把车卖掉）"
                 self._stop_flag.set()
                 return True
-            key = str(smart.get("sell_confirm_key") or "enter")
-            self._press([key], input_mode, hwnd, "确认出售")
-            self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
-            self._handled_sig = sig
-            self._handled_at = now
+        keys = list(owned_keys) or ["enter"]
+        label = {"garage": "加入车库", "gift": "送礼", "sell": "出售"}.get(owned_policy, owned_policy)
+        car = f"「{self.stats.last_reward}」" if self.stats.last_reward_kind == "car" else ""
+        self._press(keys, input_mode, hwnd, f"已拥有车辆{car} → {label}")
+        if owned_policy == "sell":
+            self._cooldown_until = now + waits["after_option_ms"] / 1000.0
+        else:
+            self._cooldown_until = now + waits["after_result_ms"] / 1000.0
+        self._handled_sig = sig
+        self._handled_at = now
+        return True
+
+    def _act_sell(self, frame, sig, now, smart, input_mode, hwnd, waits) -> bool:
+        """出售确认界面（有些流程在选完「出售」之后还会再确认一次）。"""
+        rule = smart.get("sell_price_rule") or {}
+        priced = self._read_sell_price(frame)
+        if rule.get("enabled") and rule.get("abort_on_fail") and not priced:
+            self._save_fail_frames(frame, "出售价格识别失败")
+            self._exit_reason = "出售价格没识别出来，已停止（避免误判界面把车卖掉）"
+            self._stop_flag.set()
             return True
+        key = str(smart.get("sell_confirm_key") or "enter")
+        self._press([key], input_mode, hwnd, "确认出售")
+        self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
+        self._handled_sig = sig
+        self._handled_at = now
+        return True
 
-        if role == "confirm":
-            self._press(["enter"], input_mode, hwnd, "确认弹窗")
-            self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
-            self._handled_sig = sig
-            self._handled_at = now
+    def _act_confirm(self, sig, now, input_mode, hwnd, waits) -> bool:
+        """通用确认弹窗。"""
+        self._press(["enter"], input_mode, hwnd, "确认弹窗")
+        self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
+        self._handled_sig = sig
+        self._handled_at = now
+        return True
+
+    def _act_end(self, smart) -> bool:
+        """抽奖结束界面。"""
+        if smart.get("auto_stop_on_end_template", True):
+            self._exit_reason = "识别到「抽奖结束」界面，收工"
+            self._stop_flag.set()
             return True
-
-        if role == "end":
-            if smart.get("auto_stop_on_end_template", True):
-                self._exit_reason = "识别到「抽奖结束」界面"
-                self._stop_flag.set()
-                return True
-            # 用户明确关掉了「结束自动停」，这里就静观其变：
-            # 返回 False 让主循环按轮询间隔歇一下，不然会满速空转吃 CPU
-            return False
-
-        if role == "blocked":
-            action = str(smart.get("unknown_action") or "wait")
-            if action == "enter":
-                self._press(["enter"], input_mode, hwnd, "处理阻挡界面")
-            elif action == "esc":
-                self._press(["esc"], input_mode, hwnd, "处理阻挡界面")
-            self._cooldown_until = now + max(0.6, waits["after_result_ms"] / 1000.0)
-            self._handled_sig = sig
-            self._handled_at = now
-            # 「什么都不做」也要返回 False，交给主循环 sleep，避免满速空转
-            return action in ("enter", "esc")
-
+        # 用户明确关掉了「结束自动停」，这里就静观其变：
+        # 返回 False 让主循环按轮询间隔歇一下，不然会满速空转吃 CPU
         return False
+
+    def _act_blocked(self, sig, now, smart, input_mode, hwnd, waits) -> bool:
+        """被别的界面挡住：按用户设定的兜底方式处理。"""
+        action = str(smart.get("unknown_action") or "wait")
+        if action == "enter":
+            self._press(["enter"], input_mode, hwnd, "处理阻挡界面")
+        elif action == "esc":
+            self._press(["esc"], input_mode, hwnd, "处理阻挡界面")
+        self._cooldown_until = now + max(0.6, waits["after_result_ms"] / 1000.0)
+        self._handled_sig = sig
+        self._handled_at = now
+        # 「什么都不做」也要返回 False，交给主循环 sleep，避免满速空转
+        return action in ("enter", "esc")
 
     def _press(self, keys: list[str], input_mode: str, hwnd: int, label: str) -> None:
         if not self._guard_foreground(hwnd, input_mode):
@@ -808,9 +1148,14 @@ class LotteryEngine:
             "结果界面次数": stats.results,
             "已拥有": stats.owned,
             "新车": stats.new_cars,
+            "抽到车辆": stats.car_wins,
+            "抽到 CR 次数": stats.cash_hits,
+            "抽奖所得 CR": stats.cash_credits,
             "出售次数": stats.sells,
-            "出售收益": stats.credits,
+            "出售所得 CR": stats.credits,
             "平均单价": stats.avg_price(),
+            "合计 CR": stats.total_credits(),
+            "总耗时": stats.elapsed_text(),
             "运行时长": f"{stats.elapsed():.0f}s",
             "速度": f"{stats.rate_per_min():.1f} 次/分",
         }

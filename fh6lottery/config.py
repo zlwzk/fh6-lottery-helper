@@ -90,10 +90,23 @@ DEFAULTS: dict[str, Any] = {
         "sell_confirm_key": "enter",
         "target_spins": 0,  # 0 = 不限
         "spin_count_rule": {"enabled": False, "region": None, "regex": "(\\d+)",
-                            "lang": "zh-Hans-CN", "scale": 2.0},
+                            "lang": "zh-Hans-CN", "scale": 2.0,
+                            # 剩余次数是滚动数字（一屏可能同时看到 997/998/999）：
+                            # 取最大的那个最安全 —— 顶多多抽一次，不会提前停下。
+                            "pick": "max"},  # max | min | first
         "sell_price_rule": {"enabled": False, "region": None, "regex": "([\\d][\\d,\\.]*)",
                             "lang": "en-US", "scale": 2.0,
                             "abort_on_fail": False},  # 读不到价格就不确认出售（避免误卖）
+        # 抽奖结果：自动找到「本次抽中的那一格」并读出内容，用来统计抽到的 CR / 车
+        "reward_rule": {
+            "enabled": False,
+            "region": None,          # 框选奖励面板（三个卡片所在的矩形）
+            "highlight": "bright",   # bright = 高亮格是亮色；dark = 暗色；none = 直接读整块
+            "lang": "en-US",
+            "scale": 2.0,
+            "min_digits": 3,         # 少于这个位数的数字不当钱
+            "count_cash": True,      # 抽到的 CR 计入「抽奖所得」
+        },
         "auto_stop_on_end_template": True,
         "unknown_action": "wait",  # wait | enter | esc
     },

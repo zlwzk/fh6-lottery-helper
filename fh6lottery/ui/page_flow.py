@@ -76,7 +76,8 @@ class TemplatePickDialog(QDialog):
 
 class SmartPage(PageBase):
     title = "流程（智能识别）"
-    description = "告诉助手：识别到哪个界面该做什么。左半边是「已拥有车辆」的处理策略，右半边是各界面绑定的模板。"
+    description = ("助手不背固定流程：每一轮都先看画面认出当前是哪个界面，再决定按什么键。"
+                   "下面依次是「抽到重复车怎么处理」「本次抽奖的结果怎么读」「停下来的条件」。")
 
     def __init__(self, ctx, parent: QWidget | None = None):
         super().__init__(ctx, parent=parent)
@@ -84,6 +85,7 @@ class SmartPage(PageBase):
         self._key_edits: dict[str, QLineEdit] = {}
         self._role_rows: dict[str, QWidget] = {}
         self._build_policy()
+        self._build_reward()
         self._build_waits()
         self._build_stop()
         self._build_roles()
@@ -138,6 +140,50 @@ class SmartPage(PageBase):
                      hint("防止界面认错时误卖：开启后，价格识别失败会直接停机。", wrap=False),
                      None))
 
+    def _build_reward(self) -> None:
+        card = Card("抽奖结果识别（自动统计抽到的 CR）",
+                    "抽奖结果画面上只有「本次抽中的那一格」是高亮的，助手会先找到那一格，"
+                    "再只对那一小块做识别：是钱就累加进「抽奖所得 CR」，"
+                    "是车就记一笔、并交给上面的「已拥有车辆」策略处理。")
+        self.add(card)
+
+        self.reward_enabled = QPushButton("读取每次抽奖的结果：未开启")
+        self.reward_enabled.setCheckable(True)
+        self.reward_enabled.clicked.connect(self._toggle_reward)
+        card.add(self.reward_enabled)
+
+        pick = QPushButton("框选奖励面板")
+        pick.clicked.connect(self._pick_reward_region)
+        clear = QPushButton("清除")
+        clear.setProperty("variant", "ghost")
+        clear.clicked.connect(self._clear_reward_region)
+        self.reward_region_label = hint("", wrap=False)
+        card.add(row(pick, clear, self.reward_region_label))
+        card.add(muted("框选时把中间那几列奖励卡片整个框进来即可，框小了会找不到高亮格。"))
+
+        self.reward_mode = QComboBox()
+        for value, label in (("bright", "高亮格是亮色（白底，默认）"),
+                             ("dark", "高亮格是暗色"),
+                             ("none", "不高亮，直接读整块（不推荐）")):
+            self.reward_mode.addItem(label, value)
+        self.reward_mode.currentIndexChanged.connect(
+            lambda index: self.ctx.set("smart.reward_rule.highlight",
+                                       self.reward_mode.itemData(index)))
+        card.add(row(QLabel("高亮格的样子"), self.reward_mode, None))
+
+        self.reward_cash = QPushButton("抽到的 CR 计入统计：开")
+        self.reward_cash.setCheckable(True)
+        self.reward_cash.clicked.connect(self._toggle_reward_cash)
+        card.add(row(self.reward_cash,
+                     hint("关掉后就只把结果写进日志，不累加进「抽奖所得 CR」。", wrap=False),
+                     None))
+
+        test = QPushButton("测试识别当前画面")
+        test.clicked.connect(self._test_reward)
+        card.add(row(test,
+                     hint("先让游戏停在抽奖结果界面，再点这里看能不能读到。", wrap=False),
+                     None))
+
     def _build_waits(self) -> None:
         card = Card("等待时间（按自己电脑的节奏微调）",
                     "如果助手按键太早（界面还没出现）就调大；太慢就调小。")
@@ -190,6 +236,17 @@ class SmartPage(PageBase):
         pick.clicked.connect(self._pick_count_region)
         card.add(self.count_enabled)
         card.add(row(pick, self.count_label, None))
+
+        self.count_pick = QComboBox()
+        for value, label in (("max", "取最大的（推荐：宁可多抽一次，也不会提前停）"),
+                             ("min", "取最小的"),
+                             ("first", "取读到的第一个")):
+            self.count_pick.addItem(label, value)
+        self.count_pick.currentIndexChanged.connect(
+            lambda index: self.ctx.set("smart.spin_count_rule.pick", self.count_pick.itemData(index)))
+        card.add(row(QLabel("剩余次数是滚动数字时"), self.count_pick, None))
+        card.add(muted("剩余次数那一栏是滚轮效果，一屏可能同时看到 997/998/999。默认取最大的那个；"
+                       "识别到 0 就自动收工。"))
 
     def _build_roles(self) -> None:
         card = Card("各界面绑定的模板", "点「捕获」会临时隐藏本窗口、冻结游戏画面，让你直接框选。")
@@ -279,6 +336,28 @@ class SmartPage(PageBase):
         self.count_enabled.setText("读取游戏内剩余抽奖次数："
                                    + ("已开启" if count_rule.get("enabled") else "未开启"))
         self.count_label.setText(f"区域：{self._region_text(count_rule.get('region'))}")
+        self.count_pick.blockSignals(True)
+        self.count_pick.setCurrentIndex(max(
+            0, self.count_pick.findData(str(count_rule.get("pick") or "max"))))
+        self.count_pick.blockSignals(False)
+
+        reward_rule = smart.get("reward_rule", {}) or {}
+        self.reward_enabled.blockSignals(True)
+        self.reward_enabled.setChecked(bool(reward_rule.get("enabled")))
+        self.reward_enabled.blockSignals(False)
+        self.reward_enabled.setText("读取每次抽奖的结果："
+                                    + ("已开启" if reward_rule.get("enabled") else "未开启"))
+        self.reward_region_label.setText(
+            f"区域：{self._region_text(reward_rule.get('region'))}")
+        self.reward_mode.blockSignals(True)
+        self.reward_mode.setCurrentIndex(max(
+            0, self.reward_mode.findData(str(reward_rule.get("highlight") or "bright"))))
+        self.reward_mode.blockSignals(False)
+        self.reward_cash.blockSignals(True)
+        self.reward_cash.setChecked(bool(reward_rule.get("count_cash", True)))
+        self.reward_cash.blockSignals(False)
+        self.reward_cash.setText("抽到的 CR 计入统计："
+                                 + ("开" if self.reward_cash.isChecked() else "关"))
 
         for role, holder in self._role_rows.items():
             bound = [i.name for i in self.ctx.store.by_role(role)]
@@ -344,6 +423,30 @@ class SmartPage(PageBase):
             self.ctx.set("smart.spin_count_rule.region", list(region))
             self.ctx.log("info", f"剩余次数区域已设置为 {region}")
         self.refresh()
+
+    # ---- 抽奖结果识别 ----
+    def _toggle_reward(self) -> None:
+        self.ctx.set("smart.reward_rule.enabled", bool(self.reward_enabled.isChecked()))
+        self.refresh()
+
+    def _toggle_reward_cash(self) -> None:
+        self.ctx.set("smart.reward_rule.count_cash", bool(self.reward_cash.isChecked()))
+        self.refresh()
+
+    def _pick_reward_region(self) -> None:
+        region, _shot = self.ctx.capture_region(
+            "框选抽奖结果界面中间那几列奖励卡片（要包含会被高亮的那一格）")
+        if region:
+            self.ctx.set("smart.reward_rule.region", list(region))
+            self.ctx.log("info", f"奖励面板区域已设置为 {region}")
+        self.refresh()
+
+    def _clear_reward_region(self) -> None:
+        self.ctx.set("smart.reward_rule.region", None)
+        self.refresh()
+
+    def _test_reward(self) -> None:
+        self.ctx.engine.probe_reward()
 
     def _capture(self, role: str) -> None:
         self.ctx.capture_template(role, interactive=True)

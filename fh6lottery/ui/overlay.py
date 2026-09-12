@@ -90,8 +90,9 @@ class OverlayWindow(QWidget):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(2)
         self.stat_labels: dict[str, QLabel] = {}
-        items = [("spins", "抽奖"), ("owned", "已拥有"), ("new", "新车"),
-                 ("credits", "出售收益"), ("remaining", "剩余次数"), ("rate", "速度")]
+        items = [("spins", "抽奖"), ("cars", "抽到车"), ("owned", "已拥有"),
+                 ("cash", "抽奖所得"), ("credits", "出售所得"), ("total", "合计 CR"),
+                 ("remaining", "剩余次数"), ("rate", "速度"), ("time", "耗时")]
         for index, (key, text) in enumerate(items):
             caption = QLabel(text)
             caption.setObjectName("StatLabel")
@@ -186,12 +187,15 @@ class OverlayWindow(QWidget):
 
     def set_stats(self, stats: Stats) -> None:
         self.stat_labels["spins"].setText(str(stats.spins_started))
+        self.stat_labels["cars"].setText(str(stats.car_wins))
         self.stat_labels["owned"].setText(str(stats.owned))
-        self.stat_labels["new"].setText(str(stats.new_cars))
-        self.stat_labels["credits"].setText(f"{stats.credits:,}" if stats.credits else "0")
+        self.stat_labels["cash"].setText(f"{stats.cash_credits:,}")
+        self.stat_labels["credits"].setText(f"{stats.credits:,}")
+        self.stat_labels["total"].setText(f"{stats.total_credits():,}")
         self.stat_labels["remaining"].setText(
             "-" if stats.remaining is None else str(stats.remaining))
         self.stat_labels["rate"].setText(f"{stats.rate_per_min():.0f}/分")
+        self.stat_labels["time"].setText(stats.elapsed_text())
         if stats.last_action:
             self.action_label.setText(f"动作：{stats.last_action}")
         if stats.unknown_streak > 3:

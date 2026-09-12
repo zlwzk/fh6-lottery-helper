@@ -136,9 +136,52 @@ def test_engine() -> str:
     from fh6lottery.templates import get_store
     engine = LotteryEngine(Config(), get_store())
     summary = engine.summary()
-    assert "抽奖次数" in summary
+    for key in ("抽奖次数", "抽奖所得 CR", "出售所得 CR", "合计 CR", "总耗时"):
+        assert key in summary, f"统计字段缺失：{key}"
     assert not engine.running
-    return "引擎可正常构造，统计字段齐全"
+
+    stats = engine.stats
+    stats.started_at = 1000.0
+    stats.ended_at = 1000.0 + 3725          # 1 小时 2 分 5 秒
+    assert stats.elapsed_text() == "1:02:05", f"耗时格式不对：{stats.elapsed_text()}"
+    stats.ended_at = 1000.0 + 125
+    assert stats.elapsed_text() == "02:05", f"耗时格式不对：{stats.elapsed_text()}"
+    stats.cash_credits, stats.credits = 350000, 975000
+    assert stats.total_credits() == 1325000, "合计收益算错了"
+    assert "1,325,000" in engine.summary_line(), "收工小结没有带上合计收益"
+    return "引擎可正常构造，统计与计时字段齐全"
+
+
+def test_reward_scan() -> str:
+    """用合成的「三列转盘」图验证：能找到高亮格，并分辨出钱和车。"""
+    import cv2
+    from fh6lottery.config import Config
+    from fh6lottery.engine import LotteryEngine
+    from fh6lottery.templates import get_store
+    engine = LotteryEngine(Config(), get_store())
+
+    panel = np.full((240, 720, 3), (200, 150, 60), np.uint8)   # 彩色卡面
+    cells = [(20, 70, 200, 90, "25,000"),
+             (260, 70, 200, 90, "80,000"),
+             (500, 70, 200, 90, "")]                            # 最后一格是纯车图
+    for x, y, w, h, text in cells:
+        cv2.rectangle(panel, (x, y), (x + w, y + h), (255, 255, 255), -1)
+        if text:
+            cv2.putText(panel, text, (x + 14, y + h - 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (0, 0, 0), 2)
+
+    crops = engine._reward_crops(panel, [0, 0, 720, 240], "bright")
+    assert len(crops) == 3, f"应该找到 3 个高亮格，实际 {len(crops)} 个"
+
+    parse = LotteryEngine._parse_reward
+    assert parse("25,000")[0] == "cash", "纯金额应该判成钱"
+    assert parse("CR 80,000") == ("cash", 80000, "80,000 CR"), f"带 CR 的没判对：{parse('CR 80,000')}"
+    assert parse("2021 迈凯伦 620R")[0] == "car", "车名应该判成车"
+    assert parse("Ferrari 599 GTO")[0] == "car", "英文车名应该判成车"
+    assert parse("")[0] == "unknown", "空文本应该是 unknown"
+    total = sum(v for _k, v, _l in (parse("25,000"), parse("CR 80,000")))
+    assert total == 105000, f"多格金额累加不对：{total}"
+    return f"找出 {len(crops)} 个高亮格；钱 / 车判定与累加都正确"
 
 
 def test_hotkeys() -> str:
@@ -159,7 +202,8 @@ def main() -> int:
     check("模板库读写", test_templates)
     check("全局热键解析", test_hotkeys)
     check("Windows OCR", test_ocr)
-    check("引擎构造", test_engine)
+    check("引擎构造与计时", test_engine)
+    check("抽奖结果识别", test_reward_scan)
 
     print("=" * 72)
     failed = 0

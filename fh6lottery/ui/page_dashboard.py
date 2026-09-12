@@ -107,20 +107,24 @@ class DashboardPage(PageBase):
         card.add(self.overlay_holder)
 
     def _build_stats(self) -> None:
-        card = Card("本次统计", "抽奖次数＝引擎按下开始键的次数；出售收益来自识别到的出售价格累计。")
+        card = Card("本次统计",
+                    "抽奖次数＝按下开始键的次数；抽奖所得＝识别到抽中的 CR 累计；"
+                    "出售所得＝识别到的出售价格累计；总耗时＝从按下开始到停止的这段时间。")
         self.add(card)
         grid = QGridLayout()
         grid.setSpacing(10)
-        items = [("spins", "抽奖次数", ""), ("owned", "已拥有车辆", ""),
-                 ("new", "抽到新车", ""), ("sells", "出售次数", ""),
-                 ("credits", "出售收益", "CR"), ("avg", "平均单价", "CR"),
-                 ("remaining", "游戏内剩余次数", ""), ("rate", "速度", "次/分")]
+        items = [("spins", "抽奖次数", ""), ("cars", "抽到车辆", ""),
+                 ("owned", "已拥有车辆", ""), ("new", "抽到新车", ""),
+                 ("cash", "抽奖所得", "CR"), ("credits", "出售所得", "CR"),
+                 ("total", "合计收益", "CR"), ("sells", "出售次数", ""),
+                 ("avg", "平均单价", "CR"), ("remaining", "游戏内剩余次数", ""),
+                 ("rate", "速度", "次/分"), ("elapsed", "总耗时", "")]
         for index, (key, label, unit) in enumerate(items):
             tile = StatTile(label, unit)
             self._tiles[key] = tile
             grid.addWidget(tile, index // 4, index % 4)
         card.add(grid)
-        self.elapsed_label = muted("运行时长：0 秒")
+        self.elapsed_label = muted("总耗时 00:00")
         card.add(self.elapsed_label)
 
     def _build_guide(self) -> None:
@@ -131,8 +135,11 @@ class DashboardPage(PageBase):
             "把「抽奖主界面」的按钮区域框下来，角色选「抽奖主界面（可开始抽奖）」。",
             "2. 手动抽一次，抽到已拥有车辆时按 F9，把结果界面里「已拥有 / 出售 / 送礼」"
             "那几行字框下来，角色选「结果界面 · 已拥有」。",
-            "3. 回到这里选「智能识别模式」，在「流程」页确认已拥有车辆的处理方式，点开始。",
-            "4. 万一识别不准：去「识别」页看实时画面命中了什么，调低阈值或重录模板；"
+            "3. 想让助手自动统计抽到的 CR：停在抽奖结果界面，按 F9 把中间那几列奖励卡片"
+            "整个框下来，选「抽奖结果面板」。",
+            "4. 回到「流程」页：打开「读取每次抽奖的结果」、框选奖励面板，"
+            "再确认「已拥有车辆」的处理方式（加入车库 / 送礼 / 出售），然后点开始。",
+            "5. 万一识别不准：去「识别」页看实时画面命中了什么，调低阈值或重录模板；"
             "实在不行切「节奏宏模式」，手动编排按键序列。",
         ]
         for text in steps:
@@ -243,12 +250,17 @@ class DashboardPage(PageBase):
 
     def _on_stats(self, stats: Stats) -> None:
         self._tiles["spins"].set_value(stats.spins_started)
+        self._tiles["cars"].set_value(stats.car_wins)
         self._tiles["owned"].set_value(stats.owned)
         self._tiles["new"].set_value(stats.new_cars)
         self._tiles["sells"].set_value(stats.sells)
+        self._tiles["cash"].set_value(f"{stats.cash_credits:,}")
         self._tiles["credits"].set_value(f"{stats.credits:,}")
+        self._tiles["total"].set_value(f"{stats.total_credits():,}")
         self._tiles["avg"].set_value(f"{stats.avg_price():,}")
         self._tiles["remaining"].set_value("-" if stats.remaining is None else stats.remaining)
         self._tiles["rate"].set_value(f"{stats.rate_per_min():.1f}")
-        self.elapsed_label.setText(f"运行时长：{stats.elapsed():.0f} 秒"
-                                   + (f"　最近动作：{stats.last_action}" if stats.last_action else ""))
+        self._tiles["elapsed"].set_value(stats.elapsed_text())
+        detail = stats.last_action or stats.last_state
+        self.elapsed_label.setText(f"总耗时 {stats.elapsed_text()}"
+                                   + (f"　最近动作：{detail}" if detail else ""))
