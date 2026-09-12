@@ -267,7 +267,17 @@ class OcrClient:
         except Exception as exc:
             self._error = f"OCR 临时图写入失败：{exc}"
             return None
+        try:
+            return self._ask_ocr(path, seq, lang)
+        finally:
+            # 用完就删：整屏 PNG 一张两三兆，攒在那儿能吃掉几百兆磁盘；
+            # 而 WinRT 那边在回包之前就已经把图读完了，这时候删是安全的。
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
+    def _ask_ocr(self, path, seq: int, lang: str) -> str | None:
         request = json.dumps({"path": str(path), "lang": lang,
                               "cmd": "ocr", "seq": seq}, ensure_ascii=False)
         started = time.perf_counter()
@@ -409,3 +419,53 @@ def contains_any(text: str | None, keywords: Iterable[str]) -> str | None:
         if kw and "".join(kw.split()).lower() in flat:
             return kw
     return None
+
+
+# 「价格 / 售价 / 单价」这类词后面跟着的数字才可能是价格
+PRICE_HINTS = ("价格", "售价", "单价", "price", "value", "cr")
+
+
+def biggest_int(text: str | None, hints: Iterable[str] = PRICE_HINTS,
+                min_value: int = 0) -> int | None:
+    """从一段文字里挑出最像「价格」的那个数字。
+
+    出售价格那一行通常写着「出售价格：975,000」，但用户很可能顺手把整块画面都框进去了，
+    这时标题里的年份、剩余次数之类的数字会一起读进来 —— 取第一个数字，就会读出 6 这种
+    离谱的值（来自 "FH6"）。所以：先看「价格 / 售价 / CR」这类词后面紧跟着的数字，
+    没有再退回「最大的那个」（价格通常比画面里其它数字都大）。
+    """
+    if not text:
+        return None
+    import re
+    flat = text.replace("\u00a0", " ")
+
+    def collect(segment: str) -> list[int]:
+        out: list[int] = []
+        for match in re.finditer(r"\d[\d,\.]*", segment):
+            digits = re.sub(r"[^\d]", "", match.group(0))
+            if not digits or len(digits) > 12:
+                continue
+            try:
+                out.append(int(digits))
+            except ValueError:
+                continue
+        return out
+
+    found = collect(flat)
+    if not found:
+        return None
+
+    low = flat.lower()
+    for hint in hints:
+        key = str(hint).lower()
+        if not key:
+            continue
+        start = low.find(key)
+        while start >= 0:
+            for value in collect(flat[start:start + 60]):
+                if value >= max(min_value, 1000):
+                    return value
+            start = low.find(key, start + 1)
+
+    bigger = [v for v in found if v >= min_value]
+    return max(bigger) if bigger else max(found)

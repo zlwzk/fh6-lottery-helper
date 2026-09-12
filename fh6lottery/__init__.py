@@ -5,5 +5,5 @@
   2. 模拟键盘鼠标输入（SendInput / PostMessage），不注入 DLL、不改游戏文件、不发网络包。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __app_name__ = "FH6 抽奖助手"

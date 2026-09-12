@@ -21,12 +21,16 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from . import capture, matcher, ocr as ocr_mod, paths, winutil
-from .templates import TemplateStore, get_store
+from .templates import TemplateStore, get_store, role_label
 
 PREVIEW_MAX_WIDTH = 460
 ROLE_PRIORITY = ["end", "sell", "result_owned", "result_new", "confirm", "blocked", "ready"]
 # 「已处理过的静态画面」：这些角色的界面按一次键就会切走
 STATE_ROLES = ("result_owned", "result_new", "sell", "confirm", "end")
+# 这些界面本该「按一次键就走人」。要是连续按了十来次画面还原封不动，
+# 那就不是在抽奖，而是在空转 —— 停下來把线索说清楚，别一直按。
+STREAK_ROLES = ("result_owned", "result_new", "sell", "confirm")
+SAME_ROLE_LIMIT = 12         # 同一个界面连续处理这么多次还没变化就停机
 START_GUARD_S = 0.6          # 按下「开始抽奖」后的起步保护时间
 REPEAT_GAP_S = 2.5           # 同一静态画面被重复识别时的重试间隔
 FAIL_FRAME_KEEP = 30         # 失败现场截图最多保留张数
@@ -34,6 +38,8 @@ HIGHLIGHT_MIN_AREA = 600     # 「本次抽中」的高亮格至少要有这么�
 HIGHLIGHT_MAX_RATIO = 0.45   # 占框选面积超过这个比例的连通块是背景，不是某一格
 REWARD_TEXT_MAX = 48         # 奖励文本在界面与日志里的最大长度
 REWARD_LIST_KEEP = 400       # 奖励流水最多留多少条
+FULL_REGION_RATIO = 0.85     # 框选范围超过画面的这个比例就算「整屏」，读数会不准
+SANE_PRICE_MIN = 100         # 小于这个数的「出售价格」一定是读错了
 
 
 class EngineState(str, Enum):
@@ -177,6 +183,12 @@ class LotteryEngine:
         self._stuck_since = 0.0      # 当前静态画面开始「一直没变」的时间（卡住保护用）
         self._reward_read_for = -1   # 已经读过奖励的「抽奖序号」，同一次抽奖只记一次账
         self._price_read_for = -1    # 已经读过出售价的「抽奖序号」，避免同一次卖车被记两遍
+        self._streak_role = ""       # 连着处理的是哪个界面
+        self._streak_count = 0       # 这个界面连着处理了多少次（空转检测）
+        self._acted_role = ""        # 上一次真正动手处理的是哪个界面
+        self._role_fresh = True      # 当前界面是「刚出现」还是「还停在原地」
+        self._logged_role = ""       # 上一次写进日志的界面，只在切换时记一条
+        self._region_warned: set[str] = set()
         self._foreground_warn_at = 0.0
         self._exit_reason = ""
 
@@ -212,11 +224,19 @@ class LotteryEngine:
         self._stuck_since = 0.0
         self._reward_read_for = -1
         self._price_read_for = -1
+        self._streak_role = ""
+        self._streak_count = 0
+        self._acted_role = ""
+        self._role_fresh = True
+        self._logged_role = ""
+        self._region_warned = set()
         self._exit_reason = ""
         self._refresh_roles()
         self._set_state(EngineState.RUNNING)
         mode = self.cfg.get("mode", "smart")
         self._log("info", f"开始运行（模式：{'智能识别' if mode == 'smart' else '节奏宏'}）")
+        if mode == "smart":
+            self._self_check()
         self._thread = threading.Thread(target=self._run, daemon=True, name="lottery-engine")
         self._thread.start()
         return True
@@ -317,6 +337,114 @@ class LotteryEngine:
             return base
         scales = {round(ratio, 4), round(ratio * 0.98, 4), round(ratio * 1.02, 4), 1.0}
         return tuple(sorted(s for s in scales if 0.4 <= s <= 2.5))
+
+    # ------------------------------------------------------------------ #
+    # 开局体检
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _region_ratio(region, cur_w: int, cur_h: int) -> float:
+        """框选区域占整块画面的比例（用来识别「其实是整屏」的框选）。"""
+        try:
+            _x, _y, w, h = (int(v) for v in region)
+        except (TypeError, ValueError):
+            return 0.0
+        if cur_w <= 0 or cur_h <= 0:
+            return 0.0
+        return (w * h) / float(cur_w * cur_h)
+
+    def _warn_wide_region(self, key: str, label: str, region) -> None:
+        """框选范围几乎是整块画面时提醒一次。
+
+        这种情况下读数会把标题、别的数字一起读进来，结果多半不准 ——
+        与其让用户对着一个错误数字纳闷，不如直说。每项只提醒一次，不刷屏。
+        """
+        if not region or key in self._region_warned:
+            return
+        cur_w, cur_h = self._client_size()
+        if self._region_ratio(region, cur_w, cur_h) < FULL_REGION_RATIO:
+            return
+        self._region_warned.add(key)
+        self._log("warn", f"「{label}」框选的是整块画面，读数大概率不准"
+                          "（标题、别的数字都会被当成结果读进来）："
+                          "到「流程」页重新框到真正的那一行/那一格，会稳很多")
+
+    def _self_check(self) -> None:
+        """开局体检：把那些「会让功能静默失效」的设置直接说出来。
+
+        这类毛病用户自己看不出来 —— 没框区域、模板太大、界面既没模板也没关键词、
+        输入方式游戏根本收不到。表现都长一个样：点了开始没动静，或者跑一圈什么都没统计到。
+        """
+        smart = self.cfg.get("smart", {}) or {}
+        cur_w, cur_h = self._client_size()
+        client_area = float(cur_w * cur_h)
+        problems: list[str] = []
+        notes: list[str] = []
+
+        # 1) 每个界面有没有「认得出来」的手段
+        rules = [r for r in (smart.get("keyword_rules") or []) if r.get("enabled", True)]
+        kw_roles = {str(r.get("role")) for r in rules}
+        tpl_roles = {role for role, items in self._roles_cache.items() if items}
+        tpl_desc = "、".join(f"{role_label(role)}×{len(items)}"
+                            for role, items in self._roles_cache.items() if items) or "无"
+        self._log("info", f"开局体检：模板 {tpl_desc}；启用的关键词规则 {len(rules)} 条")
+        blind = [role for role in ROLE_PRIORITY if role not in tpl_roles and role not in kw_roles]
+        if blind:
+            names = "」「".join(role_label(role) for role in blind)
+            if "ready" in blind:
+                problems.append(
+                    f"「{names}」这些界面认不出来 —— 「抽奖主界面」认不出来就永远按不下开始键。"
+                    "请到「模板库」页框一张按钮/标题附近的小图给它，"
+                    "或在「识别」页给这个角色加一条关键词规则")
+
+        # 2) 整屏的模板：画面稍微一动就废了
+        for role, items in self._roles_cache.items():
+            for entry in items:
+                h, w = entry.gray.shape[:2]
+                if client_area and w * h >= client_area * FULL_REGION_RATIO:
+                    problems.append(
+                        f"模板「{entry.item.name}」几乎覆盖整块画面（{w}×{h}）："
+                        "画面稍有变化就对不上，建议只框按钮或标题那一小块，重新录一次")
+
+        # 3) 开了识别却没框区域 / 框的是整屏 —— 统计会静默失效或读出垃圾值
+        for key, label in (("reward_rule", "抽奖结果"), ("sell_price_rule", "出售价格"),
+                           ("spin_count_rule", "剩余次数")):
+            rule = smart.get(key) or {}
+            if not rule.get("enabled"):
+                continue
+            region = rule.get("region")
+            if not region:
+                problems.append(f"已开启「{label}」识别，但还没框选区域 —— 这一项不会生效")
+            elif self._region_ratio(region, cur_w, cur_h) >= FULL_REGION_RATIO:
+                problems.append(
+                    f"「{label}」框选的是整块画面：标题、别的数字都会一起读进来，"
+                    "结果基本不准，请重新框到真正的那一行/那一格")
+
+        # 4) 输入方式：PostMessage 不少游戏是整帧忽略的
+        if str(self.cfg.get("input.mode", "global")) == "message":
+            problems.append(
+                "按键用的是「后台消息（PostMessage）」：不少游戏（尤其用 Raw Input 的）会完全忽略，"
+                "表现出来就是画面一动不动。建议到「设置 → 输入方式」改用「全局按键」")
+
+        # 5) 选了出售却没开价格识别
+        if str(smart.get("owned_policy", "garage")) == "sell" \
+                and not (smart.get("sell_price_rule") or {}).get("enabled"):
+            notes.append("已拥有车辆选了「出售」，但没开「识别出售价格」：卖车赚的 CR 不会统计")
+
+        # 6) 关键词规则在整屏上匹配，很容易被画面里的同一句话误触发
+        loose = [r for r in rules if not r.get("region")]
+        if loose:
+            notes.append(
+                f"有 {len(loose)} 条关键词规则在整块画面上匹配（"
+                + "、".join(f"「{kw}」" for r in loose[:3] for kw in (r.get("keywords") or [])[:1])
+                + "…）：如果某个界面总被认错，多半是画面里别处也写了这几个字，"
+                  "给这条规则单独框个小区域就稳了")
+
+        for text in problems:
+            self._log("warn", "⚠ " + text)
+        for text in notes:
+            self._log("info", "提示：" + text)
+        if not problems:
+            self._log("info", "开局体检没有发现明显问题")
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -500,6 +628,16 @@ class LotteryEngine:
             self.stats.last_source = info.source
             self.stats.last_score = info.score
 
+            # 界面一换就记一条，并且写清「凭什么」认定它是这个界面 ——
+            # 出问题时日志里这是唯一的线索（认错了还是没认出，一眼能看出来）。
+            if info.role != self._logged_role:
+                self._logged_role = info.role
+                detail = f"　{info.source}" if info.source else ""
+                if info.note:
+                    detail += f"　读到：{info.note}"
+                self._log("info" if info.role != "unknown" else "warn",
+                          f"识别 → {role_label(info.role)}{detail}")
+
             # ---- 3) 顺手读数记账 ----
             self._harvest(info, frame, smart)
 
@@ -507,6 +645,26 @@ class LotteryEngine:
             sig = matcher.signature(frame.image)
             acted = self._dispatch(info, frame, sig, smart, owned_policy, owned_keys,
                                    start_key, input_mode, hwnd)
+
+            # 本该「按一次键就走人」的界面，连着处理十来次画面却纹丝不动 ——
+            # 那不是抽奖，是空转。停下来把线索说清楚，比一直按下去强。
+            if acted and info.role in STREAK_ROLES:
+                if info.role == self._streak_role:
+                    self._streak_count += 1
+                else:
+                    self._streak_role, self._streak_count = info.role, 1
+                if self._streak_count >= SAME_ROLE_LIMIT:
+                    self._save_fail_frames(frame, "同一界面反复处理")
+                    self._exit_reason = (
+                        f"「{role_label(info.role)}」这个界面连续处理了 {SAME_ROLE_LIMIT} 次都没有变化，"
+                        "已自动停止。最可能是这三种情况：\n"
+                        "① 按键游戏根本没收到 —— 到「设置 → 输入方式」把「后台消息」改成「全局按键」；\n"
+                        "② 这个界面被认错了 —— 例如奖品卡片上也写着「已拥有」，"
+                        "给这条关键词规则单独框个小区域，或改用模板；\n"
+                        "③ 等待时间设得太短，游戏还没反应过来就又被按了一次。")
+                    return
+            elif info.role not in STREAK_ROLES:
+                self._streak_role, self._streak_count = "", 0
 
             if self.stats.remaining == 0:
                 self._exit_reason = "游戏内抽奖次数已为 0，收工"
@@ -593,6 +751,10 @@ class LotteryEngine:
             now = time.time()
             if now - self._last_ocr_at >= ocr_interval:
                 self._last_ocr_at = now
+                # 同一块区域（尤其是「整块画面」这种）这一轮只 OCR 一次，多条规则共用结果。
+                # 否则每条规则都把整屏截一遍、写一次临时图，又慢又占磁盘。
+                cache: dict[tuple, str | None] = {}
+                best: tuple[int, str, str, str] | None = None   # (命中词长度, 角色, 命中词, 原文)
                 for rule in smart.get("keyword_rules") or []:
                     if not rule.get("enabled"):
                         continue
@@ -600,20 +762,30 @@ class LotteryEngine:
                     if not keywords:
                         continue
                     region = rule.get("region")
-                    crop = self._crop(frame.image, region)
-                    if crop is None:
+                    lang = str(rule.get("lang") or "zh-Hans-CN")
+                    scale = float(rule.get("scale") or 1.5)
+                    key = (tuple(region) if region else (), lang, scale)
+                    if key not in cache:
+                        crop = self._crop(frame.image, region)
+                        cache[key] = None if crop is None else self._ocr.recognize(crop, lang, scale)
+                    text = cache[key]
+                    if not text:
                         continue
-                    text = self._ocr.recognize(crop, str(rule.get("lang") or "zh-Hans-CN"),
-                                               float(rule.get("scale") or 1.5))
-                    if text:
-                        info.texts[str(rule.get("id") or rule.get("role"))] = text.strip()
-                        hit = ocr_mod.contains_any(text, keywords)
-                        if hit:
-                            info.role = str(rule.get("role") or "blocked")
-                            info.source = f"OCR 命中「{hit}」"
-                            info.score = 1.0
-                            info.note = text.strip().replace("\n", " / ")[:80]
-                            return info
+                    info.texts[str(rule.get("id") or rule.get("role"))] = text.strip()
+                    hit = ocr_mod.contains_any(text, keywords)
+                    if not hit:
+                        continue
+                    # 多条规则同时命中时，取「关键词更长」的那个 —— 越长的词越具体。
+                    # 抽奖结果界面底部写着「领取奖励并再次抽奖」，而奖品卡片上可能也写着
+                    # 「已拥有」；谁更长谁更能说明「这个界面到底是干嘛的」，按长度取才不会认错。
+                    if best is None or len(hit) > best[0]:
+                        best = (len(hit), str(rule.get("role") or "blocked"), hit, text.strip())
+                if best:
+                    info.role = best[1]
+                    info.source = f"OCR 命中「{best[2]}」"
+                    info.score = 1.0
+                    info.note = best[3].replace("\n", " / ")[:80]
+                    return info
         return info
 
     @staticmethod
@@ -635,7 +807,9 @@ class LotteryEngine:
         """读游戏里的「剩余抽奖机会」。"""
         smart = self.cfg.get("smart", {}) or {}
         rule = smart.get("spin_count_rule") or {}
-        crop = self._crop(frame.image, rule.get("region"))
+        region = rule.get("region")
+        self._warn_wide_region("spin_count_rule", "剩余次数", region)
+        crop = self._crop(frame.image, region)
         if crop is None:
             return
         text = self._ocr.recognize(crop, str(rule.get("lang") or "zh-Hans-CN"),
@@ -673,6 +847,7 @@ class LotteryEngine:
         region = rule.get("region")
         if not region:
             return
+        self._warn_wide_region("reward_rule", "抽奖结果", region)
         # 转盘是一列一列停的，每一列各中一格（Super Wheelspin 一次给三份），
         # 所以要把所有高亮格都读出来再汇总，不能只看最大的那一块。
         crops = self._reward_crops(frame.image, region, str(rule.get("highlight") or "bright"))
@@ -868,14 +1043,19 @@ class LotteryEngine:
             return False
         if self._price_read_for == self.stats.spins_started:
             return True      # 这一次已经记过账了
-        crop = self._crop(frame.image, rule.get("region"))
+        region = rule.get("region")
+        self._warn_wide_region("sell_price_rule", "出售价格", region)
+        crop = self._crop(frame.image, region)
         if crop is None:
             return False
         text = self._ocr.recognize(crop, str(rule.get("lang") or "en-US"),
                                    float(rule.get("scale") or 2.0))
-        value = ocr_mod.first_int(text, str(rule.get("regex") or r"[\d][\d,\.]*"))
-        if value is None:
-            self._log("warn", f"价格识别失败（原始文本：{(text or '').strip()[:60]!r}）")
+        # 不能「取读到的第一个数字」：框选偏大时会把标题里的年份之类一起读进来，
+        # 结果读出 6 CR 这种离谱值。优先看「价格 / 售价 / CR」附近，其次取最大的那个。
+        value = ocr_mod.biggest_int(text, hints=ocr_mod.PRICE_HINTS, min_value=SANE_PRICE_MIN)
+        if value is None or value < SANE_PRICE_MIN:
+            self._log("warn", f"价格识别失败（读出 {value!r}，原始文本：{(text or '').strip()[:60]!r}）："
+                              "把框选范围收到「出售价格：xxx」那一行会稳很多")
             return False
         self._price_read_for = self.stats.spins_started
         self._note_sale(value)
@@ -964,6 +1144,11 @@ class LotteryEngine:
             "after_confirm_ms": int(waits.get("after_confirm_ms", 700)),
         }
 
+        # 这个界面是「刚出现」还是「还停在原地」——已拥有车辆、结果界面这类计数
+        # 只在刚出现时算一次，否则同一个弹窗被按了十次就会被记成十台车。
+        self._role_fresh = role != self._acted_role
+        self._acted_role = role
+
         if role == "ready":
             return self._act_ready(frame, sig, now, smart, start_key, input_mode, hwnd, waits)
         if role == "result_new":
@@ -1006,8 +1191,9 @@ class LotteryEngine:
     def _act_result_new(self, sig, now, input_mode, hwnd, waits) -> bool:
         """抽到新车 → 收下继续。"""
         self._press(["enter"], input_mode, hwnd, "抽到新车 → 领取")
-        self.stats.results += 1
-        self.stats.new_cars += 1
+        if self._role_fresh:      # 同上：只在这一屏刚出现时记一次
+            self.stats.results += 1
+            self.stats.new_cars += 1
         self._cooldown_until = now + waits["after_result_ms"] / 1000.0
         self._handled_sig = sig
         self._handled_at = now
@@ -1021,8 +1207,10 @@ class LotteryEngine:
         选出售时，价格就写在选项那一行（「出售价格：975,000」），
         所以趁这个界面还在赶紧读出来记账，不用等后面的确认界面。
         """
-        self.stats.results += 1
-        self.stats.owned += 1
+        # 只在弹窗「刚出现」时计数：同一个弹窗反复按，不能记成好几台车
+        if self._role_fresh:
+            self.stats.results += 1
+            self.stats.owned += 1
         if owned_policy == "sell":
             rule = smart.get("sell_price_rule") or {}
             priced = self._read_sell_price(frame)

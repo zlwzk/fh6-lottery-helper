@@ -184,6 +184,41 @@ def test_reward_scan() -> str:
     return f"找出 {len(crops)} 个高亮格；钱 / 车判定与累加都正确"
 
 
+def test_price_and_region() -> str:
+    """验证「出售价格」怎么读、以及「框选了一大片」能不能被发现。
+
+    这两件事都是「静默出错」的典型：价格读成 6 CR、或者框了整屏读出一堆无关数字，
+    界面照样在跑，只是统计全是错的。所以单独拿出来用合成文本钉一遍。
+    """
+    from fh6lottery import ocr as ocr_mod
+    from fh6lottery.config import Config
+    from fh6lottery.engine import FULL_REGION_RATIO, SANE_PRICE_MIN, LotteryEngine
+    from fh6lottery.templates import get_store
+
+    # 框选偏大时会把标题里的「FH6」「剩余 7 次」一起读进来，但不能把 6 当成价格
+    noisy = "FH6 抽奖 剩余 7 次 出售价格：975,000"
+    got = ocr_mod.biggest_int(noisy, min_value=SANE_PRICE_MIN)
+    assert got == 975000, f"整屏文本里的价格读错了：{noisy!r} → {got}"
+    assert ocr_mod.biggest_int("出售价格 250,000", min_value=SANE_PRICE_MIN) == 250000
+    # 「价格 / 售价 / CR」附近的数字优先于画面里最大的那个数字
+    assert ocr_mod.biggest_int("已抽 30 次 售价 45,000", min_value=SANE_PRICE_MIN) == 45000
+    assert ocr_mod.biggest_int("CR 1,200,000", min_value=SANE_PRICE_MIN) == 1200000
+    # 读不到就只能返回 None，不能瞎猜一个数出来
+    assert ocr_mod.biggest_int("没有数字") is None
+    assert ocr_mod.biggest_int("") is None
+    assert ocr_mod.biggest_int(None) is None
+
+    engine = LotteryEngine(Config(), get_store())
+    whole = engine._region_ratio([0, 0, 1920, 1080], 1920, 1080)
+    assert whole >= FULL_REGION_RATIO, f"整屏框选没被识别出来：{whole}"
+    small = engine._region_ratio([100, 100, 300, 40], 1920, 1080)
+    assert small < 0.05, f"小范围框选算错了：{small}"
+    assert engine._region_ratio(None, 1920, 1080) == 0.0
+    engine._self_check()      # 开局体检必须能跑完（哪怕配置是空的）
+    return (f"整屏文本里读出价格 975,000；整屏占比 {whole:.2f} ≥ {FULL_REGION_RATIO}，"
+            "开局体检可正常执行")
+
+
 def test_hotkeys() -> str:
     from fh6lottery import winutil
     parsed = winutil.hotkey_spec("F7")
@@ -204,6 +239,7 @@ def main() -> int:
     check("Windows OCR", test_ocr)
     check("引擎构造与计时", test_engine)
     check("抽奖结果识别", test_reward_scan)
+    check("价格读取与框选体检", test_price_and_region)
 
     print("=" * 72)
     failed = 0
