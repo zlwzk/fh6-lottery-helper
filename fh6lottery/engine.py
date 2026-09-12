@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import threading
 import time
 from dataclasses import dataclass, field
@@ -18,11 +19,15 @@ from typing import Any
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-from . import capture, matcher, ocr as ocr_mod, winutil
+from . import capture, matcher, ocr as ocr_mod, paths, winutil
 from .templates import TemplateStore, get_store
 
 PREVIEW_MAX_WIDTH = 460
 ROLE_PRIORITY = ["end", "sell", "result_owned", "result_new", "confirm", "blocked", "ready"]
+# 「已处理过的静态画面」：这些角色的界面按一次键就会切走
+STATE_ROLES = ("result_owned", "result_new", "sell", "confirm", "end")
+START_GUARD_S = 0.6          # 按下「开始抽奖」后的起步保护时间
+FAIL_FRAME_KEEP = 30         # 失败现场截图最多保留张数
 
 
 class EngineState(str, Enum):
@@ -113,14 +118,16 @@ def _preview(image: np.ndarray) -> np.ndarray | None:
 
 
 class _TplEntry:
-    __slots__ = ("id", "name", "role", "threshold", "gray")
+    __slots__ = ("id", "name", "role", "threshold", "gray", "region", "scales")
 
-    def __init__(self, item, gray):
+    def __init__(self, item, gray, scales=None):
         self.id = item.id
         self.name = item.name
         self.role = item.role
         self.threshold = item.threshold
         self.gray = gray
+        self.region = list(item.region) if getattr(item, "region", None) else None
+        self.scales = tuple(scales) if scales else None
 
 
 class LotteryEngine:
@@ -138,10 +145,11 @@ class LotteryEngine:
         self._roles_cache: dict[str, Any] = {}
         self._last_preview_emit = 0.0
         self._cooldown_until = 0.0
-        self._pending_price_at = 0.0
+        self._waiting_result_until = 0.0
         self._last_ocr_at = 0.0
         self._last_sig = ""
         self._handled_sig = ""
+        self._handled_at = 0.0
         self._foreground_warn_at = 0.0
         self._exit_reason = ""
 
@@ -171,8 +179,9 @@ class LotteryEngine:
         self._stop_flag.clear()
         self._paused.clear()
         self._cooldown_until = 0.0
-        self._pending_price_at = 0.0
+        self._waiting_result_until = 0.0
         self._last_sig = self._handled_sig = ""
+        self._handled_at = 0.0
         self._exit_reason = ""
         self._refresh_roles()
         self._set_state(EngineState.RUNNING)
@@ -235,14 +244,49 @@ class LotteryEngine:
         self.signals.statsChanged.emit(self.stats.clone())
 
     def _refresh_roles(self) -> None:
-        """把模板库里各角色的模板抓成可匹配的条目。"""
+        """把模板库里各角色的模板抓成可匹配的条目，并算好各自的缩放档位。"""
+        smart = self.cfg.get("smart", {}) or {}
+        base = (0.95, 1.0, 1.05) if smart.get("multi_scale") else (1.0,)
+        auto = bool(smart.get("auto_scale", True))
+        cur_w, cur_h = self._client_size()
         entries: dict[str, list[_TplEntry]] = {role: [] for role in ROLE_PRIORITY}
         for item in self.store.items:
             gray = self.store.gray(item.id)
             if gray is None:
                 continue
-            entries.setdefault(item.role, []).append(_TplEntry(item, gray))
+            scales = self._scales_for(item, base, auto, cur_w, cur_h)
+            entries.setdefault(item.role, []).append(_TplEntry(item, gray, scales))
         self._roles_cache = entries
+
+    def _client_size(self) -> tuple[int, int]:
+        info = winutil.window_info(int(self.cfg.get("window.hwnd", 0) or 0))
+        if info is None:
+            return 0, 0
+        return int(info.client[2]), int(info.client[3])
+
+    @staticmethod
+    def _scales_for(item, base: tuple[float, ...], auto: bool,
+                    cur_w: int, cur_h: int) -> tuple[float, ...]:
+        """按「当前客户区宽 / 采集时客户区宽」推算缩放档位。
+
+        换了分辨率或改了窗口大小后，模板不用重录也能对上。
+        """
+        if not auto:
+            return base
+        ref = getattr(item, "ref_size", None) or None
+        if not ref or cur_w <= 0:
+            return base
+        try:
+            ref_w = int(ref[0])
+        except (TypeError, ValueError, IndexError):
+            return base
+        if ref_w <= 0:
+            return base
+        ratio = cur_w / float(ref_w)
+        if abs(ratio - 1.0) < 0.01 or not (0.5 <= ratio <= 2.0):
+            return base
+        scales = {round(ratio, 4), round(ratio * 0.98, 4), round(ratio * 1.02, 4), 1.0}
+        return tuple(sorted(s for s in scales if 0.4 <= s <= 2.5))
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -294,9 +338,9 @@ class LotteryEngine:
                 if kind == "click":
                     if not self._guard_foreground(hwnd, input_mode):
                         continue
+                    x, y = self._resolve_click(step, hwnd)
                     try:
-                        winutil.click_at(int(step.get("x", 0)), int(step.get("y", 0)),
-                                         input_mode, hwnd)
+                        winutil.click_at(x, y, input_mode, hwnd)
                         self.stats.actions += 1
                         self.stats.last_action = f"点击 ({step.get('x')}, {step.get('y')})"
                         self._log("info", self.stats.last_action)
@@ -329,6 +373,20 @@ class LotteryEngine:
                 self._exit_reason = "鼠标急停触发（左上角）"
                 return
 
+    def _resolve_click(self, step: dict, hwnd: int) -> tuple[int, int]:
+        """把节奏宏里的点击坐标解析成屏幕坐标。
+
+        click_relative 开启时坐标以「客户区左上角」为原点，窗口挪了位置也不会点偏。
+        """
+        x = int(step.get("x", 0) or 0)
+        y = int(step.get("y", 0) or 0)
+        if not self.cfg.get("rhythm.click_relative", True):
+            return x, y
+        origin = winutil.client_origin(hwnd)
+        if origin is None:
+            return x, y
+        return origin[0] + x, origin[1] + y
+
     def _emit_rhythm_preview(self, hwnd: int) -> None:
         now = time.time()
         if now - self._last_preview_emit < 0.6:
@@ -347,6 +405,7 @@ class LotteryEngine:
         smart = self.cfg.get("smart", {}) or {}
         poll = max(60, int(smart.get("poll_interval_ms", 220))) / 1000.0
         ocr_interval = max(200, int(smart.get("ocr_interval_ms", 900))) / 1000.0
+        stuck_timeout = max(5.0, float(smart.get("stuck_timeout_s", 20) or 20))
         target = int(smart.get("target_spins", 0) or 0)
         max_unknown = max(3, int(self.cfg.get("safety.max_unknown_before_stop", 30)))
         hwnd = int(self.cfg.get("window.hwnd", 0) or 0)
@@ -390,16 +449,31 @@ class LotteryEngine:
             self.stats.last_source = info.source
             self.stats.last_score = info.score
 
-            acted = self._dispatch(info, frame, smart, owned_policy, owned_keys,
+            sig = matcher.signature(frame.image)
+            acted = self._dispatch(info, frame, sig, smart, owned_policy, owned_keys,
                                    start_key, input_mode, hwnd)
 
             if target and self.stats.spins_started >= target:
                 self._exit_reason = f"已完成设定的 {target} 次抽奖"
                 return
 
+            # 画面长时间一动不动 → 游戏卡住，或模板匹配到了错误的固定位置
+            if sig and sig == self._handled_sig and info.role != "unknown":
+                if not self._handled_at:
+                    self._handled_at = now
+                elif now - self._handled_at >= stuck_timeout:
+                    self._save_fail_frames(frame, "画面长时间无变化")
+                    self._exit_reason = (f"画面在同一状态停留超过 {int(stuck_timeout)} 秒都没有变化，"
+                                         "已自动停止。游戏可能卡住了，"
+                                         "也可能是模板匹配到了错误的位置（可在日志里看识别来源）")
+                    return
+            else:
+                self._handled_at = 0.0
+
             if info.role == "unknown":
                 self.stats.unknown_streak += 1
                 if self.stats.unknown_streak >= max_unknown:
+                    self._save_fail_frames(frame, "连续识别失败")
                     self._exit_reason = ("连续识别失败，已自动停止。"
                                          "建议到「识别」页看看实时画面，补录模板或调低阈值")
                     return
@@ -413,11 +487,6 @@ class LotteryEngine:
                     if self.stats.remaining == 0:
                         self._exit_reason = "游戏内抽奖次数已为 0"
                         return
-
-            # 出售价格（选项出现后延迟读取）
-            if self._pending_price_at and now >= self._pending_price_at:
-                self._pending_price_at = 0.0
-                self._read_sell_price(frame)
 
             self._emit_stats()
             if not acted:
@@ -507,31 +576,66 @@ class LotteryEngine:
             self._log("info", f"游戏内剩余抽奖次数：{value}")
         self.stats.remaining = value
 
-    def _read_sell_price(self, frame: capture.Frame) -> None:
+    def _read_sell_price(self, frame: capture.Frame) -> bool:
+        """读出售价并计入统计；返回是否读到了数字。"""
         smart = self.cfg.get("smart", {}) or {}
         rule = smart.get("sell_price_rule") or {}
         if not rule.get("enabled"):
-            return
+            return False
         crop = self._crop(frame.image, rule.get("region"))
         if crop is None:
-            return
+            return False
         text = self._ocr.recognize(crop, str(rule.get("lang") or "en-US"),
                                    float(rule.get("scale") or 2.0))
         value = ocr_mod.first_int(text, str(rule.get("regex") or r"[\d][\d,\.]*"))
         if value is None:
             self._log("warn", f"价格识别失败（原始文本：{(text or '').strip()[:60]!r}）")
-            return
+            return False
         self.stats.sells += 1
         self.stats.prices.append(value)
         if len(self.stats.prices) > 500:
             del self.stats.prices[:-500]
         self.stats.credits += value
         self._log("info", f"出售价格：{value:,}（累计 {self.stats.credits:,}）")
+        return True
+
+    # ------------------------------------------------------------------ #
+    # 失败现场
+    # ------------------------------------------------------------------ #
+    def _save_fail_frames(self, frame: capture.Frame, reason: str) -> None:
+        """停机时把当前画面存下来，方便用户照着补模板。"""
+        if not self.cfg.get("safety.save_fail_frames", True):
+            return
+        image = getattr(frame, "image", None)
+        if image is None:
+            return
+        try:
+            import cv2
+            paths.FROZEN_DIR.mkdir(parents=True, exist_ok=True)
+            target = paths.FROZEN_DIR / f"fail_{_dt.datetime.now():%Y%m%d_%H%M%S}.png"
+            if not cv2.imwrite(str(target), image):
+                raise OSError("写入图片失败")
+            self._prune_fail_frames()
+            self._log("info", f"已保存失败现场截图：{paths.display_path(target)}（{reason}）")
+        except Exception as exc:
+            self._log("warn", f"保存失败现场截图出错：{exc}")
+
+    @staticmethod
+    def _prune_fail_frames(keep: int = FAIL_FRAME_KEEP) -> None:
+        try:
+            files = sorted(paths.FROZEN_DIR.glob("fail_*.png"))
+        except OSError:
+            return
+        for old in files[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ #
     # 动作派发
     # ------------------------------------------------------------------ #
-    def _dispatch(self, info: RecogInfo, frame: capture.Frame, smart: dict,
+    def _dispatch(self, info: RecogInfo, frame: capture.Frame, sig: str, smart: dict,
                   owned_policy: str, owned_keys: list, start_key: str,
                   input_mode: str, hwnd: int) -> bool:
         now = time.time()
@@ -539,11 +643,13 @@ class LotteryEngine:
         if role == "unknown":
             return False
 
-        sig = matcher.signature(frame.image)
-        if role in ("result_owned", "result_new", "sell", "confirm", "end"):
-            if sig and sig == self._handled_sig and now < self._cooldown_until + 3.0:
-                # 同一个静态画面，已经处理过，避免重复按键把菜单按乱
-                return False
+        if role in STATE_ROLES and sig and sig == self._handled_sig:
+            # 画面还没变，说明上一次按键游戏还没消化，别重复按同一个界面
+            return False
+
+        if role == "ready" and now < self._waiting_result_until:
+            # 已经开始抽奖了，正在等结果界面：转盘动画里会反复命中「开始」按钮
+            return False
 
         if now < self._cooldown_until:
             return False
@@ -560,8 +666,11 @@ class LotteryEngine:
             self._press([start_key], input_mode, hwnd, "按下开始抽奖")
             self.stats.spins_started += 1
             self.stats.last_action = f"开始抽奖（第 {self.stats.spins_started} 次）"
-            self._cooldown_until = now + waits["after_start_ms"] / 1000.0
-            self._handled_sig = ""
+            # 不再死等固定的 after_start_ms：只做一小段起步保护，
+            # 之后一识别到结果界面就立刻接手（低配机不会误判，高配机不用白等）
+            self._cooldown_until = now + START_GUARD_S
+            self._waiting_result_until = now + waits["after_start_ms"] / 1000.0
+            self._handled_sig = sig
             return True
 
         if role == "result_new":
@@ -579,7 +688,6 @@ class LotteryEngine:
             label = {"garage": "加入车库", "gift": "送礼", "sell": "出售"}.get(owned_policy, owned_policy)
             self._press(keys, input_mode, hwnd, f"处理已拥有车辆 → {label}")
             if owned_policy == "sell":
-                self._pending_price_at = now + waits["after_option_ms"] / 1000.0
                 self._cooldown_until = now + waits["after_option_ms"] / 1000.0
             else:
                 self._cooldown_until = now + waits["after_result_ms"] / 1000.0
@@ -587,7 +695,14 @@ class LotteryEngine:
             return True
 
         if role == "sell":
-            self._read_sell_price(frame)
+            rule = smart.get("sell_price_rule") or {}
+            priced = self._read_sell_price(frame)
+            if rule.get("enabled") and rule.get("abort_on_fail") and not priced:
+                # 界面认出来了但价格读不出来，多半是认错了，宁可停下来也别乱卖
+                self._save_fail_frames(frame, "出售价格识别失败")
+                self._exit_reason = "出售价格没识别出来，已停止（避免误判界面把车卖掉）"
+                self._stop_flag.set()
+                return True
             key = str(smart.get("sell_confirm_key") or "enter")
             self._press([key], input_mode, hwnd, "确认出售")
             self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0

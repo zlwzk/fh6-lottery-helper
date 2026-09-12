@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                               QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QVBoxLayout, QWidget)
 
 from .. import capture, matcher, winutil
@@ -118,7 +118,9 @@ class TemplatesPage(PageBase):
                 Qt.TransformationMode.SmoothTransformation))
         layout.addWidget(thumb)
         # 命中位置示意图放在缩略图上会看不清，这里用尺寸文字替代
-        size_label = QLabel(f"{item.width}×{item.height}")
+        size_label = QLabel(f"{item.width}×{item.height}　"
+                            + (f"区域 {item.region[2]}×{item.region[3]}"
+                               if item.region else "整屏匹配"))
         size_label.setObjectName("Hint")
 
         info = QVBoxLayout()
@@ -155,6 +157,12 @@ class TemplatesPage(PageBase):
         buttons.setSpacing(5)
         test = QPushButton("测试匹配")
         test.clicked.connect(lambda _checked=False, i=item.id: self._test(i))
+        area = QPushButton("匹配区域 ✓" if item.region else "匹配区域")
+        area.setToolTip("限定模板只在画面的一小块区域里匹配，能明显减少「长得像」导致的误判")
+        menu = QMenu(area)
+        menu.addAction("框选匹配区域", lambda i=item.id: self._pick_region(i))
+        menu.addAction("清除区域限制", lambda i=item.id: self._clear_region(i))
+        area.setMenu(menu)
         recapture = QPushButton("重录")
         recapture.setProperty("variant", "ghost")
         recapture.clicked.connect(lambda _checked=False, i=item.id: self._recapture(i))
@@ -162,6 +170,7 @@ class TemplatesPage(PageBase):
         remove.setProperty("variant", "danger")
         remove.clicked.connect(lambda _checked=False, i=item.id: self._remove(i))
         buttons.addWidget(test)
+        buttons.addWidget(area)
         buttons.addWidget(recapture)
         buttons.addWidget(remove)
         layout.addLayout(buttons)
@@ -251,12 +260,36 @@ class TemplatesPage(PageBase):
         if template is None:
             self.ctx.log("warn", "测试失败：模板图读取不了")
             return
-        found = matcher.match_one(matcher._gray(frame.image), template, (0.95, 1.0, 1.05))
+        # 限定了匹配区域的话，只在那块区域里找（跟实际运行时一致），
+        # 命中框再换算回整帧坐标
+        target, offset_x, offset_y = matcher.crop_region(matcher._gray(frame.image), item.region)
+        found = matcher.match_one(target, template, (0.95, 1.0, 1.05))
         if found is None:
-            self.ctx.log("warn", f"「{item.name}」比画面还大，匹配不了")
+            self.ctx.log("warn", f"「{item.name}」比画面（或限定的匹配区域）还大，匹配不了")
             return
         score, box = found
+        box = (box[0] + offset_x, box[1] + offset_y, box[2], box[3])
         verdict = "命中" if score >= float(item.threshold) else "未命中"
         self.ctx.log("info" if verdict == "命中" else "warn",
                      f"「{item.name}」当前画面相似度 {score:.3f}（阈值 {item.threshold:.2f}）→ {verdict}"
                      f"，位置 {box}")
+
+    def _pick_region(self, template_id: str) -> None:
+        """框选这个模板的搜索区域（相对游戏客户区），减少画面里相似图案的干扰。"""
+        item = self.ctx.store.get(template_id)
+        if item is None:
+            return
+        region = self.ctx.capture_template_region(
+            f"框选「{item.name}」可能出现的位置范围（Esc 取消）")
+        if not region:
+            return
+        self.ctx.set_template_region(template_id, region)
+        self.ctx.log("info", f"「{item.name}」的匹配区域已设为 {region[2]}×{region[3]}"
+                             f"（相对游戏窗口 {region[0]}, {region[1]}）")
+
+    def _clear_region(self, template_id: str) -> None:
+        item = self.ctx.store.get(template_id)
+        if item is None:
+            return
+        self.ctx.set_template_region(template_id, None)
+        self.ctx.log("info", f"「{item.name}」已恢复为整屏匹配")

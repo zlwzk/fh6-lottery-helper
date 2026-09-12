@@ -6,10 +6,11 @@ import json
 import os
 import subprocess
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QLabel,
-                               QLineEdit, QPlainTextEdit, QPushButton, QSlider,
-                               QSpinBox, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
+                               QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                               QSlider, QSpinBox, QTextEdit, QVBoxLayout, QWidget)
 
 from .. import paths, winutil
 from ..hotkeys import ACTION_LABELS
@@ -220,6 +221,11 @@ class SettingsPage(PageBase):
         self.unknown_spin.valueChanged.connect(
             lambda value: self.ctx.set("safety.max_unknown_before_stop", int(value)))
         card.add(row(QLabel("连续识别失败"), self.unknown_spin, None))
+        holder3, self.failframe_switch = toggle_row(
+            "识别失败停机时保存现场截图，便于照着补模板",
+            bool(self.ctx.config.get("safety.save_fail_frames", True)),
+            lambda value: self.ctx.set("safety.save_fail_frames", bool(value)))
+        card.add(holder3)
         card.add(muted("本工具只做「截屏识别 + 模拟按键」，不读写游戏内存、不注入模块、不碰网络包。"))
 
     def _build_hotkeys(self) -> None:
@@ -283,6 +289,14 @@ class SettingsPage(PageBase):
         reset_button.setProperty("variant", "danger")
         reset_button.clicked.connect(self._reset)
         card.add(row(open_button, export_button, import_button, reset_button, None))
+        frames_button = QPushButton("打开失败截图目录")
+        frames_button.clicked.connect(lambda: self._open_dir(paths.FROZEN_DIR))
+        self.update_button = QPushButton("检查更新")
+        self.update_button.clicked.connect(self._check_update)
+        card.add(row(frames_button, self.update_button, None))
+        self.update_status = hint("")
+        card.add(self.update_status)
+        card.add(muted("「检查更新」只在你点它的时候联网读一次 GitHub 发布页，平时不联网。"))
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
@@ -374,6 +388,22 @@ class SettingsPage(PageBase):
         self.ctx.save()
         self.ctx.configChanged.emit()
         self.ctx.log("warn", "已恢复默认设置")
+
+    def _check_update(self) -> None:
+        from .. import __version__
+        from ..update import check_latest
+        self.update_status.setText("正在检查…（最多 6 秒）")
+        QApplication.processEvents()
+        tag, url, error = check_latest()
+        if error:
+            message = f"检查更新失败：{error}"
+        elif tag and tag.lstrip("vV") != __version__:
+            QDesktopServices.openUrl(QUrl(url))
+            message = f"发现新版本 {tag}（当前 {__version__}），已在浏览器打开发布页"
+        else:
+            message = f"已是最新版本（{__version__}）"
+        self.update_status.setText(message)
+        self.ctx.log("info", message)
 
 
 class LogPage(PageBase):

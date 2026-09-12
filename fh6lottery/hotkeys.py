@@ -33,10 +33,11 @@ user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.RegisterClassExW.restype = wt.ATOM
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 
-ACTIONS = ["start", "stop", "capture", "toggle_overlay"]
+ACTIONS = ["start", "stop", "pause", "capture", "toggle_overlay"]
 ACTION_LABELS = {
     "start": "开始抽奖",
     "stop": "停止抽奖",
+    "pause": "暂停 / 继续",
     "capture": "捕获模板（冻结画面框选）",
     "toggle_overlay": "显示/隐藏悬浮窗",
 }

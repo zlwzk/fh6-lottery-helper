@@ -26,6 +26,7 @@ class DashboardPage(PageBase):
         ctx.stateChanged.connect(self._on_state)
         ctx.statsUpdated.connect(self._on_stats)
         ctx.configChanged.connect(self.refresh)
+        ctx.pausedChanged.connect(self._on_paused)
         self._on_state("idle")
         self.refresh()
 
@@ -77,7 +78,8 @@ class DashboardPage(PageBase):
         self.start_button.setProperty("variant", "primary")
         self.start_button.setMinimumHeight(38)
         self.start_button.clicked.connect(self._start)
-        self.pause_button = QPushButton("暂停")
+        self.pause_button = QPushButton("暂停（F11）")
+        self.pause_button.setToolTip("全局热键可在「设置 → 全局热键」里改")
         self.pause_button.clicked.connect(self._pause)
         self.stop_button = QPushButton("停止（F8）")
         self.stop_button.setProperty("variant", "danger")
@@ -137,7 +139,7 @@ class DashboardPage(PageBase):
             card.add(muted(text))
         card.add(hline())
         card.add(muted("安全兜底：鼠标移到屏幕左上角立刻停止；游戏不在前台时不发按键；"
-                       "任何时候按 F8 都能停。"))
+                       "任何时候 F8 停止、F11 暂停 / 继续。"))
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
@@ -234,7 +236,10 @@ class DashboardPage(PageBase):
         self.stop_button.setEnabled(running)
         self.pause_button.setEnabled(running)
         if not running:
-            self.pause_button.setText("暂停")
+            self.pause_button.setText("暂停（F11）")
+
+    def _on_paused(self, paused: bool) -> None:
+        self.pause_button.setText("继续（F11）" if paused else "暂停（F11）")
 
     def _on_stats(self, stats: Stats) -> None:
         self._tiles["spins"].set_value(stats.spins_started)

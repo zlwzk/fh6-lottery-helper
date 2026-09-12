@@ -25,6 +25,27 @@ def _gray(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
+def crop_region(gray: np.ndarray, region) -> tuple[np.ndarray, int, int]:
+    """按 (x, y, w, h) 裁出搜索区域，返回 (裁剪图, 偏移 x, 偏移 y)。
+
+    region 为空或非法时原样返回，偏移为 (0, 0)。
+    """
+    h, w = gray.shape[:2]
+    if not region:
+        return gray, 0, 0
+    try:
+        x, y, rw, rh = (int(v) for v in region)
+    except (TypeError, ValueError):
+        return gray, 0, 0
+    if rw <= 0 or rh <= 0:
+        return gray, 0, 0
+    x0 = max(0, min(w - 1, x))
+    y0 = max(0, min(h - 1, y))
+    x1 = max(x0 + 1, min(w, x + rw))
+    y1 = max(y0 + 1, min(h, y + rh))
+    return np.ascontiguousarray(gray[y0:y1, x0:x1]), x0, y0
+
+
 def match_one(frame_gray: np.ndarray, template_gray: np.ndarray,
               scales: tuple[float, ...] = (1.0,)) -> tuple[float, tuple[int, int, int, int]] | None:
     """返回 (最高相似度, 命中框)。"""
@@ -58,14 +79,21 @@ def match_one(frame_gray: np.ndarray, template_gray: np.ndarray,
 
 
 def match_all(frame: np.ndarray, entries, scales: tuple[float, ...] = (1.0,)) -> list[MatchHit]:
-    """entries 需提供 .id/.name/.role/.threshold/.gray 属性。"""
+    """entries 需提供 .id/.name/.role/.threshold/.gray 属性。
+
+    可选属性：
+      .region —— (x, y, w, h) 限定搜索区域（帧内坐标），只在这一小块里找，能明显减少误判；
+      .scales —— 该模板专属的缩放档位，缺省时用传入的 scales。
+    """
     frame_gray = _gray(frame)
     hits: list[MatchHit] = []
     for entry in entries:
         tpl = getattr(entry, "gray", None)
         if tpl is None or getattr(tpl, "size", 0) == 0:
             continue
-        found = match_one(frame_gray, tpl, scales)
+        target, offset_x, offset_y = crop_region(frame_gray, getattr(entry, "region", None))
+        entry_scales = getattr(entry, "scales", None) or scales
+        found = match_one(target, tpl, tuple(entry_scales))
         if found is None:
             continue
         score, box = found
@@ -75,7 +103,7 @@ def match_all(frame: np.ndarray, entries, scales: tuple[float, ...] = (1.0,)) ->
             template_id=str(getattr(entry, "id", "")),
             name=str(getattr(entry, "name", "")),
             role=str(getattr(entry, "role", "")),
-            score=score, box=box,
+            score=score, box=(box[0] + offset_x, box[1] + offset_y, box[2], box[3]),
         ))
     hits.sort(key=lambda h: h.score, reverse=True)
     return hits

@@ -261,6 +261,20 @@ def window_at_point(x: int, y: int) -> int:
     return int(user32.GetAncestor(hwnd, GA_ROOT)) if hwnd else 0
 
 
+def client_origin(hwnd: int) -> tuple[int, int] | None:
+    """客户区左上角的屏幕坐标；窗口无效时返回 None。
+
+    节奏宏里的点击坐标存的是「客户区内相对坐标」，发送前要加上这个原点，
+    这样游戏窗口挪了位置也不会点偏。
+    """
+    if not hwnd:
+        return None
+    cx, cy, cw, ch = _client_rect_screen(hwnd)
+    if cw <= 0 or ch <= 0:
+        return None
+    return cx, cy
+
+
 # --------------------------------------------------------------------------- #
 # 按键映射与模拟输入
 # --------------------------------------------------------------------------- #
@@ -330,6 +344,7 @@ MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_VIRTUALDESK = 0x4000
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -413,19 +428,22 @@ def click_at(x: int, y: int, mode: str = "global", hwnd: int = 0) -> None:
         user32.PostMessageW(wt.HWND(hwnd), 0x0202, 0, lp)  # WM_LBUTTONUP
         return
 
-    screen_w = user32.GetSystemMetrics(0)
-    screen_h = user32.GetSystemMetrics(1)
-    nx = int(x * 65535 / max(1, screen_w - 1))
-    ny = int(y * 65535 / max(1, screen_h - 1))
+    # SendInput 的绝对坐标是按「虚拟桌面」归一化到 0~65535 的，必须带上
+    # MOUSEEVENTF_VIRTUALDESK；否则副屏（负坐标）会被算到主屏上。
+    vx, vy, vw, vh = virtual_screen_rect()
+    nx = int((x - vx) * 65535 / max(1, vw - 1))
+    ny = int((y - vy) * 65535 / max(1, vh - 1))
+    nx = max(0, min(65535, nx))
+    ny = max(0, min(65535, ny))
+    move_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
     events = (INPUT * 2)()
     events[0].type = INPUT_MOUSE
     events[0].u.mi = MOUSEINPUT(dx=nx, dy=ny, mouseData=0,
-                                dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                                time=0, dwExtraInfo=None)
+                                dwFlags=move_flags, time=0, dwExtraInfo=None)
     events[1].type = INPUT_MOUSE
     events[1].u.mi = MOUSEINPUT(dx=nx, dy=ny, mouseData=0,
-                                dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
-                                | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP,
+                                dwFlags=move_flags | MOUSEEVENTF_LEFTDOWN
+                                | MOUSEEVENTF_LEFTUP,
                                 time=0, dwExtraInfo=None)
     user32.SendInput(2, events, ctypes.sizeof(INPUT))
 

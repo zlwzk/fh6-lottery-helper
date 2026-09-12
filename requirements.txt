@@ -6,10 +6,13 @@
 # - 截图用 mss（多屏/高 DPI 友好）
 # - 识别用 OpenCV 模板匹配
 # - OCR 直接调用 Windows 自带的 Windows.Media.Ocr，不需要额外安装 tesseract
+#
+# 版本区间取「允许打补丁与小版本、挡住大版本跳跃」，避免某次重装依赖后
+# 拉到一个行为不同的主版本，导致打包出来的东西和验证过的不一致。
 
-PySide6>=6.6
-opencv-python>=4.8
-numpy>=1.24
-mss>=9.0
-pillow>=10.0
-pyinstaller>=6.0   ; # 仅打包时需要
+PySide6>=6.6,<7.0
+opencv-python>=4.8,<6.0
+numpy>=1.24,<3.0
+mss>=9.0,<11.0
+pillow>=10.0,<13.0
+pyinstaller>=6.0,<7.0   ; # 仅打包时需要

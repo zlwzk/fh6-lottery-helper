@@ -30,6 +30,19 @@ def role_label(role: str) -> str:
     return ROLE_LABELS.get(role, role or "未指定")
 
 
+def _ints_or_none(value: Any, length: int) -> list[int] | None:
+    """把配置里的坐标序列规整成固定长度的非负整数列表，非法时返回 None。"""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        items = [int(v) for v in value]
+    except (TypeError, ValueError):
+        return None
+    if len(items) != length or any(v < 0 for v in items):
+        return None
+    return items
+
+
 @dataclass
 class TemplateItem:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -40,12 +53,16 @@ class TemplateItem:
     created: str = ""
     width: int = 0
     height: int = 0
+    region: list[int] | None = None      # 限定匹配区域（客户区相对坐标 x, y, w, h）
+    ref_size: list[int] | None = None    # 采集时的客户区尺寸 [w, h]，用于跨分辨率自适应
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "name": self.name, "role": self.role, "file": self.file,
             "threshold": self.threshold, "created": self.created,
             "width": self.width, "height": self.height,
+            "region": list(self.region) if self.region else None,
+            "ref_size": list(self.ref_size) if self.ref_size else None,
         }
 
     @classmethod
@@ -59,6 +76,8 @@ class TemplateItem:
             created=str(data.get("created") or ""),
             width=int(data.get("width") or 0),
             height=int(data.get("height") or 0),
+            region=_ints_or_none(data.get("region"), 4),
+            ref_size=_ints_or_none(data.get("ref_size"), 2),
         )
 
 
@@ -167,7 +186,7 @@ class TemplateStore:
 
     # ---------------- 增删改 ----------------
     def add(self, name: str, role: str, image: np.ndarray,
-            threshold: float = 0.86) -> TemplateItem:
+            threshold: float = 0.86, region=None, ref_size=None) -> TemplateItem:
         import cv2
         paths.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
         item = TemplateItem(
@@ -176,6 +195,8 @@ class TemplateStore:
             threshold=float(threshold),
             created=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             height=int(image.shape[0]), width=int(image.shape[1]),
+            region=_ints_or_none(region, 4),
+            ref_size=_ints_or_none(ref_size, 2),
         )
         item.file = f"{item.id}.png"
         cv2.imwrite(str(paths.TEMPLATE_DIR / item.file), image)
@@ -183,14 +204,15 @@ class TemplateStore:
         self.save()
         return item
 
-    def add_from_file(self, path: str, name: str, role: str, threshold: float = 0.86) -> TemplateItem:
+    def add_from_file(self, path: str, name: str, role: str, threshold: float = 0.86,
+                      region=None, ref_size=None) -> TemplateItem:
         import cv2
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("无法读取该图片文件")
-        return self.add(name, role, img, threshold)
+        return self.add(name, role, img, threshold, region=region, ref_size=ref_size)
 
-    def replace_image(self, template_id: str, image: np.ndarray) -> bool:
+    def replace_image(self, template_id: str, image: np.ndarray, ref_size=None) -> bool:
         import cv2
         item = self.get(template_id)
         if item is None or image is None or getattr(image, "size", 0) == 0:
@@ -200,6 +222,9 @@ class TemplateStore:
             item.file = f"{item.id}.png"
         cv2.imwrite(str(paths.TEMPLATE_DIR / item.file), image)
         item.width, item.height = int(image.shape[1]), int(image.shape[0])
+        size = _ints_or_none(ref_size, 2)
+        if size:
+            item.ref_size = size
         with self._lock:
             self._gray_cache.pop(template_id, None)
             self._thumb_cache.clear()

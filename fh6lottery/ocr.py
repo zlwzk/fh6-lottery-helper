@@ -255,6 +255,7 @@ class OcrClient:
     def _recognize_once(self, image: np.ndarray, lang: str) -> str | None:
         with self._lock:
             self._seq += 1
+            seq = self._seq
             path = self._frame_dir / f"ocr_{self._seq % 128:03d}.png"
         try:
             self._frame_dir.mkdir(parents=True, exist_ok=True)
@@ -264,7 +265,7 @@ class OcrClient:
             return None
 
         request = json.dumps({"path": str(path), "lang": lang,
-                              "cmd": "ocr"}, ensure_ascii=False)
+                              "cmd": "ocr", "seq": seq}, ensure_ascii=False)
         started = time.perf_counter()
         with self._lock:
             if not self._proc or self._proc.poll() is not None or self._proc.stdin is None:
@@ -278,7 +279,7 @@ class OcrClient:
                 self._error = f"OCR 通信失败：{exc}"
                 self._ready = False
                 return None
-            reply = self._read_reply()
+            reply = self._read_reply(seq)
 
         elapsed = (time.perf_counter() - started) * 1000.0
         if not reply:
@@ -295,7 +296,12 @@ class OcrClient:
             return None
         return str(data.get("text") or "")
 
-    def _read_reply(self) -> str | None:
+    def _read_reply(self, seq: int) -> str | None:
+        """只接受本轮的回复。
+
+        如果某次调用超时，它的回复会晚到并残留在队列里；下一次调用又把它读走，
+        就会把上一帧的文字当成当前画面。所以这里按序号严格匹配，不匹配的直接丢掉。
+        """
         deadline = time.time() + CALL_TIMEOUT
         while time.time() < deadline:
             try:
@@ -306,8 +312,22 @@ class OcrClient:
                 self._ready = False
                 return None
             line = line.strip()
-            if line:
-                return line
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            try:
+                got = int(data.get("seq"))
+            except (TypeError, ValueError):
+                # 启动握手等没有序号的包
+                continue
+            if got != seq:
+                continue
+            return line
         return None
 
     @staticmethod

@@ -23,6 +23,7 @@ DEFAULTS: dict[str, Any] = {
     "hotkeys": {
         "start": "F7",
         "stop": "F8",
+        "pause": "F11",
         "capture": "F9",
         "toggle_overlay": "F10",
     },
@@ -46,12 +47,15 @@ DEFAULTS: dict[str, Any] = {
         "require_foreground": True,     # 仅当游戏在前台时才发按键（全局模式）
         "max_unknown_before_stop": 30,  # 连续识别失败上限
         "min_action_interval_ms": 260,  # 两次按键之间的最小间隔
+        "save_fail_frames": True,       # 识别失败停机时把画面存到 frames\ 便于补模板
     },
     "smart": {
         "poll_interval_ms": 220,
         "ocr_interval_ms": 900,
         "match_threshold": 0.86,
         "multi_scale": False,
+        "auto_scale": True,             # 按窗口尺寸自动缩放模板（换分辨率不用重录）
+        "stuck_timeout_s": 20,          # 同一个静态画面停留多久算「卡住」
         "use_templates": True,
         "use_ocr": True,
         "roles": {
@@ -88,7 +92,8 @@ DEFAULTS: dict[str, Any] = {
         "spin_count_rule": {"enabled": False, "region": None, "regex": "(\\d+)",
                             "lang": "zh-Hans-CN", "scale": 2.0},
         "sell_price_rule": {"enabled": False, "region": None, "regex": "([\\d][\\d,\\.]*)",
-                            "lang": "en-US", "scale": 2.0},
+                            "lang": "en-US", "scale": 2.0,
+                            "abort_on_fail": False},  # 读不到价格就不确认出售（避免误卖）
         "auto_stop_on_end_template": True,
         "unknown_action": "wait",  # wait | enter | esc
     },
@@ -98,6 +103,7 @@ DEFAULTS: dict[str, Any] = {
         ],
         "loop_delay_ms": 0,
         "max_loops": 0,
+        "click_relative": True,  # 点击坐标相对游戏客户区（窗口挪了位置也不点偏）
     },
     "post": {
         "enabled": False,

@@ -257,7 +257,8 @@ class MainWindow(QMainWindow):
         hotkeys = self.ctx.config.get("hotkeys", {}) or {}
         self.status_hotkey.setText(
             f"{hotkeys.get('start', 'F7')} 开始 · {hotkeys.get('stop', 'F8')} 停止 · "
-            f"{hotkeys.get('capture', 'F9')} 捕获 · {hotkeys.get('toggle_overlay', 'F10')} 悬浮窗")
+            f"{hotkeys.get('pause', 'F11')} 暂停 · {hotkeys.get('capture', 'F9')} 捕获 · "
+            f"{hotkeys.get('toggle_overlay', 'F10')} 悬浮窗")
         self.status_ocr.setText(self.ctx.ocr_status())
 
     # ------------------------------------------------------------------ #

@@ -60,7 +60,9 @@ def main() -> int:
     def _hook(exc_type, exc_value, exc_tb):
         detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         try:
-            (paths.LOG_DIR / "crash.log").write_text(detail, encoding="utf-8")
+            # 崩溃日志经常被贴进公开的 issue，落盘前先把本机路径和用户名折掉
+            (paths.LOG_DIR / "crash.log").write_text(paths.sanitize_text(detail),
+                                                     encoding="utf-8")
         except OSError:
             pass
         try:

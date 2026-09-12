@@ -131,6 +131,12 @@ class SmartPage(PageBase):
         price_layout.addWidget(clear)
         price_layout.addWidget(self.price_region_label, 1)
         card.add(self.price_holder)
+        self.price_abort = QPushButton("读不到价格就不确认出售：关")
+        self.price_abort.setCheckable(True)
+        self.price_abort.clicked.connect(self._toggle_price_abort)
+        card.add(row(self.price_abort,
+                     hint("防止界面认错时误卖：开启后，价格识别失败会直接停机。", wrap=False),
+                     None))
 
     def _build_waits(self) -> None:
         card = Card("等待时间（按自己电脑的节奏微调）",
@@ -155,6 +161,11 @@ class SmartPage(PageBase):
         self.target_spin.valueChanged.connect(
             lambda value: self.ctx.set("smart.target_spins", int(value)))
         card.add(row(QLabel("抽够多少次后自动停止（0 = 不限）"), self.target_spin, None))
+
+        self.stuck_spin = _spin(20, 5, 3600, 5, " 秒")
+        self.stuck_spin.valueChanged.connect(
+            lambda value: self.ctx.set("smart.stuck_timeout_s", int(value)))
+        card.add(row(QLabel("同一画面停留超过多久算卡住并停止"), self.stuck_spin, None))
 
         self.end_switch = QPushButton("识别到「抽奖结束」界面时自动停止：开")
         self.end_switch.setCheckable(True)
@@ -233,6 +244,10 @@ class SmartPage(PageBase):
         self.target_spin.setValue(int(smart.get("target_spins", 0) or 0))
         self.target_spin.blockSignals(False)
 
+        self.stuck_spin.blockSignals(True)
+        self.stuck_spin.setValue(int(smart.get("stuck_timeout_s", 20) or 20))
+        self.stuck_spin.blockSignals(False)
+
         self.end_switch.setChecked(bool(smart.get("auto_stop_on_end_template", True)))
         self.end_switch.setText("识别到「抽奖结束」界面时自动停止："
                                 + ("开" if self.end_switch.isChecked() else "关"))
@@ -248,6 +263,11 @@ class SmartPage(PageBase):
         self.price_enabled.setChecked(bool(price_rule.get("enabled")))
         self.price_enabled.blockSignals(False)
         self.price_enabled.setText("识别出售价格：" + ("已开启" if price_rule.get("enabled") else "未开启"))
+        self.price_abort.blockSignals(True)
+        self.price_abort.setChecked(bool(price_rule.get("abort_on_fail")))
+        self.price_abort.blockSignals(False)
+        self.price_abort.setText("读不到价格就不确认出售："
+                                 + ("开" if price_rule.get("abort_on_fail") else "关"))
         region = price_rule.get("region")
         self.price_region_label.setText(f"区域：{self._region_text(region)}")
         self.price_holder.setVisible(policy == "sell")
@@ -301,6 +321,10 @@ class SmartPage(PageBase):
 
     def _toggle_end(self) -> None:
         self.ctx.set("smart.auto_stop_on_end_template", bool(self.end_switch.isChecked()))
+        self.refresh()
+
+    def _toggle_price_abort(self) -> None:
+        self.ctx.set("smart.sell_price_rule.abort_on_fail", bool(self.price_abort.isChecked()))
         self.refresh()
 
     def _pick_price_region(self) -> None:
@@ -375,6 +399,12 @@ class RhythmPage(PageBase):
             lambda value: self.ctx.set("rhythm.max_loops", int(value)))
         card.add(row(QLabel("每轮结束后等待"), self.loop_delay,
                      QLabel("最多循环"), self.max_loops, None))
+        self.click_relative = QPushButton("点击坐标相对游戏窗口：开")
+        self.click_relative.setCheckable(True)
+        self.click_relative.setToolTip("开启后，点击步骤的坐标以游戏客户区左上角为原点，"
+                                       "窗口挪了位置也不会点偏")
+        self.click_relative.clicked.connect(self._toggle_click_relative)
+        card.add(self.click_relative)
         card.add(muted("节奏模式不计数、不识别，只按序列发按键；鼠标移到屏幕左上角依然可以急停。"))
         ctx.configChanged.connect(self.refresh)
 
@@ -394,6 +424,11 @@ class RhythmPage(PageBase):
         self.max_loops.blockSignals(True)
         self.max_loops.setValue(int(self.ctx.config.get("rhythm.max_loops", 0) or 0))
         self.max_loops.blockSignals(False)
+        self.click_relative.blockSignals(True)
+        self.click_relative.setChecked(bool(self.ctx.config.get("rhythm.click_relative", True)))
+        self.click_relative.blockSignals(False)
+        self.click_relative.setText("点击坐标相对游戏窗口："
+                                    + ("开" if self.click_relative.isChecked() else "关"))
 
     def _step_row(self, index: int, step: dict) -> QWidget:
         holder = QFrame()
@@ -532,3 +567,7 @@ class RhythmPage(PageBase):
             {"type": "key", "key": "enter", "hold_ms": 40, "delay_ms": 700, "x": 0, "y": 0},
         ])
         self.ctx.log("info", "已套用「快速连按」预设（只按 Enter，间隔 0.7 秒）")
+
+    def _toggle_click_relative(self) -> None:
+        self.ctx.set("rhythm.click_relative", bool(self.click_relative.isChecked()))
+        self.refresh()

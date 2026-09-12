@@ -53,3 +53,33 @@ def display_path(p: Path | str) -> str:
     if home and s.lower().startswith(home.lower()):
         return "%USERPROFILE%" + s[len(home):]
     return s
+
+
+def sanitize_text(text: str) -> str:
+    """把一段文本里的本机路径 / 用户名 / 机器名换成占位符。
+
+    日志和崩溃信息经常被贴到公开的 issue 里，落盘前统一过一遍，
+    规则与界面上的 display_path 保持一致。
+    """
+    if not text:
+        return text
+    import re
+
+    out = str(text)
+    pairs = [
+        (os.environ.get("LOCALAPPDATA", ""), "%LOCALAPPDATA%"),
+        (os.environ.get("APPDATA", ""), "%APPDATA%"),
+        (os.environ.get("TEMP", ""), "%TEMP%"),
+        (os.environ.get("TMP", ""), "%TEMP%"),
+        (str(Path.home()), "%USERPROFILE%"),
+    ]
+    # 先替换更长的路径（LOCALAPPDATA 在 APPDATA 之上），避免被短前缀截胡
+    for value, placeholder in sorted(pairs, key=lambda item: len(item[0]), reverse=True):
+        if value and len(value) > 3:
+            out = re.sub(re.escape(value), placeholder, out, flags=re.IGNORECASE)
+    # 兜底：任何盘符下的 \Users\<名字>\
+    out = re.sub(r"([A-Za-z]:\\Users\\)[^\\\s\"']+", r"\1<用户名>", out, flags=re.IGNORECASE)
+    computer = os.environ.get("COMPUTERNAME", "")
+    if computer and len(computer) > 2:
+        out = re.sub(re.escape(computer), "<机器名>", out, flags=re.IGNORECASE)
+    return out
