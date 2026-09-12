@@ -27,6 +27,7 @@ ROLE_PRIORITY = ["end", "sell", "result_owned", "result_new", "confirm", "blocke
 # 「已处理过的静态画面」：这些角色的界面按一次键就会切走
 STATE_ROLES = ("result_owned", "result_new", "sell", "confirm", "end")
 START_GUARD_S = 0.6          # 按下「开始抽奖」后的起步保护时间
+REPEAT_GAP_S = 2.5           # 同一静态画面被重复识别时的重试间隔
 FAIL_FRAME_KEEP = 30         # 失败现场截图最多保留张数
 
 
@@ -147,9 +148,9 @@ class LotteryEngine:
         self._cooldown_until = 0.0
         self._waiting_result_until = 0.0
         self._last_ocr_at = 0.0
-        self._last_sig = ""
         self._handled_sig = ""
-        self._handled_at = 0.0
+        self._handled_at = 0.0       # 上次对 _handled_sig 这个画面动作的时间（重复画面重试节流用）
+        self._stuck_since = 0.0      # 当前静态画面开始「一直没变」的时间（卡住保护用）
         self._foreground_warn_at = 0.0
         self._exit_reason = ""
 
@@ -180,8 +181,9 @@ class LotteryEngine:
         self._paused.clear()
         self._cooldown_until = 0.0
         self._waiting_result_until = 0.0
-        self._last_sig = self._handled_sig = ""
+        self._handled_sig = ""
         self._handled_at = 0.0
+        self._stuck_since = 0.0
         self._exit_reason = ""
         self._refresh_roles()
         self._set_state(EngineState.RUNNING)
@@ -457,18 +459,18 @@ class LotteryEngine:
                 self._exit_reason = f"已完成设定的 {target} 次抽奖"
                 return
 
-            # 画面长时间一动不动 → 游戏卡住，或模板匹配到了错误的固定位置
+            # 按键之后画面一直没变 → 游戏卡住，或模板匹配到了错误的固定位置
             if sig and sig == self._handled_sig and info.role != "unknown":
-                if not self._handled_at:
-                    self._handled_at = now
-                elif now - self._handled_at >= stuck_timeout:
+                if not self._stuck_since:
+                    self._stuck_since = now
+                elif now - self._stuck_since >= stuck_timeout:
                     self._save_fail_frames(frame, "画面长时间无变化")
                     self._exit_reason = (f"画面在同一状态停留超过 {int(stuck_timeout)} 秒都没有变化，"
                                          "已自动停止。游戏可能卡住了，"
                                          "也可能是模板匹配到了错误的位置（可在日志里看识别来源）")
                     return
             else:
-                self._handled_at = 0.0
+                self._stuck_since = 0.0
 
             if info.role == "unknown":
                 self.stats.unknown_streak += 1
@@ -644,8 +646,14 @@ class LotteryEngine:
             return False
 
         if role in STATE_ROLES and sig and sig == self._handled_sig:
-            # 画面还没变，说明上一次按键游戏还没消化，别重复按同一个界面
-            return False
+            # 画面还没变，说明上一次按键游戏还没消化，先别重复按同一个界面。
+            # 但如果是「按键后画面恰好又长得一模一样」（例如连续抽到同一辆车、
+            # 结果界面反复出现），一直不动手就会干等到卡住保护停机；
+            # 等够 REPEAT_GAP_S 就按一次重试，既不狂按也不空等。
+            if now - self._handled_at < REPEAT_GAP_S:
+                return False
+            self._log("warn", f"画面已停留 {REPEAT_GAP_S:.1f} 秒没有变化，重试一次按键")
+            self._handled_at = now
 
         if role == "ready" and now < self._waiting_result_until:
             # 已经开始抽奖了，正在等结果界面：转盘动画里会反复命中「开始」按钮
@@ -671,6 +679,7 @@ class LotteryEngine:
             self._cooldown_until = now + START_GUARD_S
             self._waiting_result_until = now + waits["after_start_ms"] / 1000.0
             self._handled_sig = sig
+            self._handled_at = now
             return True
 
         if role == "result_new":
@@ -679,6 +688,7 @@ class LotteryEngine:
             self.stats.new_cars += 1
             self._cooldown_until = now + waits["after_result_ms"] / 1000.0
             self._handled_sig = sig
+            self._handled_at = now
             return True
 
         if role == "result_owned":
@@ -692,6 +702,7 @@ class LotteryEngine:
             else:
                 self._cooldown_until = now + waits["after_result_ms"] / 1000.0
             self._handled_sig = sig
+            self._handled_at = now
             return True
 
         if role == "sell":
@@ -707,19 +718,24 @@ class LotteryEngine:
             self._press([key], input_mode, hwnd, "确认出售")
             self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
             self._handled_sig = sig
+            self._handled_at = now
             return True
 
         if role == "confirm":
             self._press(["enter"], input_mode, hwnd, "确认弹窗")
             self._cooldown_until = now + waits["after_confirm_ms"] / 1000.0
             self._handled_sig = sig
+            self._handled_at = now
             return True
 
         if role == "end":
             if smart.get("auto_stop_on_end_template", True):
                 self._exit_reason = "识别到「抽奖结束」界面"
                 self._stop_flag.set()
-            return True
+                return True
+            # 用户明确关掉了「结束自动停」，这里就静观其变：
+            # 返回 False 让主循环按轮询间隔歇一下，不然会满速空转吃 CPU
+            return False
 
         if role == "blocked":
             action = str(smart.get("unknown_action") or "wait")
@@ -729,12 +745,16 @@ class LotteryEngine:
                 self._press(["esc"], input_mode, hwnd, "处理阻挡界面")
             self._cooldown_until = now + max(0.6, waits["after_result_ms"] / 1000.0)
             self._handled_sig = sig
-            return True
+            self._handled_at = now
+            # 「什么都不做」也要返回 False，交给主循环 sleep，避免满速空转
+            return action in ("enter", "esc")
 
         return False
 
     def _press(self, keys: list[str], input_mode: str, hwnd: int, label: str) -> None:
         if not self._guard_foreground(hwnd, input_mode):
+            # 游戏不在前台：这次不按键。稍微歇一下，别让主循环满速空转
+            self._sleep_cancellable(0.2)
             return
         key_delay = max(0, int(self.cfg.get("input.key_delay_ms", 90))) / 1000.0
         hold = int(self.cfg.get("input.hold_ms", 45))

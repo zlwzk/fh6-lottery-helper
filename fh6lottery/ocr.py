@@ -80,17 +80,21 @@ while ($true) {
     $line = $line.Trim()
     if ($line -eq '') { continue }
     if ($line -eq '__exit__') { break }
+    # 回包必须带上请求序号：调用方按序号丢弃「上一次超时后才迟到的回复」，
+    # 少了这个字段每个包都会被当成过期数据丢掉，OCR 就一直是空的。
+    $seq = 0
     try {
         $req = $line | ConvertFrom-Json
+        if ($null -ne $req.seq) { $seq = [int]$req.seq }
         if ($req.cmd -eq 'ping') {
-            $payload = @{ ok = $true; text = '' }
+            $payload = @{ ok = $true; text = ''; seq = $seq }
         } else {
             $text = Invoke-Ocr ([string]$req.path) ([string]$req.lang)
-            if ($null -eq $text) { $payload = @{ ok = $false; error = 'no-ocr-engine' } }
-            else { $payload = @{ ok = $true; text = $text } }
+            if ($null -eq $text) { $payload = @{ ok = $false; error = 'no-ocr-engine'; seq = $seq } }
+            else { $payload = @{ ok = $true; text = $text; seq = $seq } }
         }
     } catch {
-        $payload = @{ ok = $false; error = $_.Exception.Message }
+        $payload = @{ ok = $false; error = $_.Exception.Message; seq = $seq }
     }
     [Console]::Out.WriteLine(($payload | ConvertTo-Json -Compress))
     [Console]::Out.Flush()
