@@ -4,7 +4,7 @@
 一口气把攒下来的抽奖次数刷完，不用手点几千下。
 
 **下载：** [Releases](https://github.com/zlwzk/fh6-lottery-helper/releases/latest) → `FH6LotteryHelper.exe`
-（单文件，双击即可运行，无需安装 Python）　**当前版本：v1.2.1**
+（单文件，双击即可运行，无需安装 Python）　**当前版本：v1.2.2**
 
 > 本工具只做两件事，**绝不碰游戏本体**：
 > 1. **看屏幕** —— 截屏 + 模板匹配 / Windows 自带 OCR；
