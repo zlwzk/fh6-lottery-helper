@@ -16,7 +16,8 @@ from .. import paths, winutil
 from ..hotkeys import ACTION_LABELS
 from . import theme
 from .page_base import PageBase
-from .widgets import Card, KeyCaptureEdit, hint, hline, muted, row, toggle_row
+from .widgets import (Card, KeyCaptureEdit, hint, hline, muted, row, toggle_row,
+                      with_unit)
 
 
 class PostPage(PageBase):
@@ -44,15 +45,15 @@ class PostPage(PageBase):
             lambda value: self.ctx.set("post.shutdown", bool(value)))
         self.shutdown_delay = QSpinBox()
         self.shutdown_delay.setRange(0, 3600)
-        self.shutdown_delay.setSuffix(" 秒后关机")
         self.shutdown_delay.setValue(int(ctx.config.get("post.shutdown_delay_s", 60)))
-        self.shutdown_delay.setFixedWidth(140)
+        self.shutdown_delay.setFixedWidth(110)
         self.shutdown_delay.valueChanged.connect(
             lambda value: self.ctx.set("post.shutdown_delay_s", int(value)))
         abort = QPushButton("取消关机")
         abort.setProperty("variant", "ghost")
         abort.clicked.connect(self._abort_shutdown)
-        card.add(row(shutdown_row, self.shutdown_delay, abort, QLabel(""), None))
+        card.add(row(shutdown_row, with_unit(self.shutdown_delay, "秒后关机"),
+                     abort, QLabel(""), None))
         card.add(muted("留 60 秒缓冲，反悔时点「取消关机」或运行 shutdown /a。"))
 
         # 关游戏
@@ -91,11 +92,10 @@ class PostPage(PageBase):
         self.esc_count = QSpinBox()
         self.esc_count.setRange(1, 5)
         self.esc_count.setValue(int(ctx.config.get("post.pause_esc_count", 1)))
-        self.esc_count.setSuffix(" 次")
-        self.esc_count.setFixedWidth(90)
+        self.esc_count.setFixedWidth(70)
         self.esc_count.valueChanged.connect(
             lambda value: self.ctx.set("post.pause_esc_count", int(value)))
-        card.add(row(esc_row, self.esc_count, None))
+        card.add(row(esc_row, with_unit(self.esc_count, "次"), None))
         sound_row, self.sound_switch = toggle_row(
             "结束时播放提示音", bool(ctx.config.get("post.sound")),
             lambda value: self.ctx.set("post.sound", bool(value)))
@@ -180,26 +180,25 @@ class SettingsPage(PageBase):
 
         self.hold_spin = QSpinBox()
         self.hold_spin.setRange(10, 2000)
-        self.hold_spin.setSuffix(" ms 按住")
         self.hold_spin.setValue(int(self.ctx.config.get("input.hold_ms", 45)))
-        self.hold_spin.setFixedWidth(130)
+        self.hold_spin.setFixedWidth(80)
         self.hold_spin.valueChanged.connect(
             lambda value: self.ctx.set("input.hold_ms", int(value)))
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 2000)
-        self.delay_spin.setSuffix(" ms 间隔")
         self.delay_spin.setValue(int(self.ctx.config.get("input.key_delay_ms", 90)))
-        self.delay_spin.setFixedWidth(130)
+        self.delay_spin.setFixedWidth(80)
         self.delay_spin.valueChanged.connect(
             lambda value: self.ctx.set("input.key_delay_ms", int(value)))
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(0, 5000)
-        self.gap_spin.setSuffix(" ms 动作间隔")
         self.gap_spin.setValue(int(self.ctx.config.get("safety.min_action_interval_ms", 260)))
-        self.gap_spin.setFixedWidth(150)
+        self.gap_spin.setFixedWidth(80)
         self.gap_spin.valueChanged.connect(
             lambda value: self.ctx.set("safety.min_action_interval_ms", int(value)))
-        card.add(row(QLabel("按键手感"), self.hold_spin, self.delay_spin, self.gap_spin, None))
+        card.add(row(QLabel("按键手感"), with_unit(self.hold_spin, "ms 按住"),
+                     with_unit(self.delay_spin, "ms 间隔"),
+                     with_unit(self.gap_spin, "ms 动作间隔"), None))
 
     def _build_safety(self) -> None:
         card = Card("安全保护")
@@ -215,12 +214,11 @@ class SettingsPage(PageBase):
         card.add(holder2)
         self.unknown_spin = QSpinBox()
         self.unknown_spin.setRange(3, 9999)
-        self.unknown_spin.setSuffix(" 次后停止")
         self.unknown_spin.setValue(int(self.ctx.config.get("safety.max_unknown_before_stop", 30)))
-        self.unknown_spin.setFixedWidth(150)
+        self.unknown_spin.setFixedWidth(90)
         self.unknown_spin.valueChanged.connect(
             lambda value: self.ctx.set("safety.max_unknown_before_stop", int(value)))
-        card.add(row(QLabel("连续识别失败"), self.unknown_spin, None))
+        card.add(row(QLabel("连续识别失败"), with_unit(self.unknown_spin, "次后停止"), None))
         holder3, self.failframe_switch = toggle_row(
             "识别失败停机时保存现场截图，便于照着补模板",
             bool(self.ctx.config.get("safety.save_fail_frames", True)),

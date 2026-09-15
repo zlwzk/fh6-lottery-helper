@@ -12,17 +12,15 @@ from .. import winutil
 from ..templates import ROLE_ORDER, role_label
 from . import theme
 from .page_base import PageBase
-from .widgets import Card, hint, hline, muted, row
+from .widgets import Card, hint, hline, muted, row, with_unit
 
 
-def _spin(value: int, minimum: int = 0, maximum: int = 600000, step: int = 50,
-          suffix: str = " ms") -> QSpinBox:
+def _spin(value: int, minimum: int = 0, maximum: int = 600000, step: int = 50) -> QSpinBox:
+    """数值输入框。单位不放框内，由调用方用 ``with_unit()`` 加在外面。"""
     box = QSpinBox()
     box.setRange(minimum, maximum)
     box.setSingleStep(step)
     box.setValue(int(value))
-    if suffix:
-        box.setSuffix(suffix)
     box.setFixedWidth(120)
     return box
 
@@ -197,21 +195,21 @@ class SmartPage(PageBase):
             box = _spin(default)
             box.valueChanged.connect(lambda value, k=key: self.ctx.set(f"smart.waits.{k}", int(value)))
             self._wait_spins[key] = box
-            card.add(row(QLabel(label), box, None))
+            card.add(row(QLabel(label), with_unit(box, "ms"), None))
         return card
 
     def _build_stop(self) -> None:
         card = Card("停止条件与兜底")
         self.add(card)
-        self.target_spin = _spin(0, 0, 1000000, 1, " 次")
+        self.target_spin = _spin(0, 0, 1000000, 1)
         self.target_spin.valueChanged.connect(
             lambda value: self.ctx.set("smart.target_spins", int(value)))
-        card.add(row(QLabel("抽够多少次后自动停止（0 = 不限）"), self.target_spin, None))
+        card.add(row(QLabel("抽够多少次后自动停止（0 = 不限）"), with_unit(self.target_spin, "次"), None))
 
-        self.stuck_spin = _spin(20, 5, 3600, 5, " 秒")
+        self.stuck_spin = _spin(20, 5, 3600, 5)
         self.stuck_spin.valueChanged.connect(
             lambda value: self.ctx.set("smart.stuck_timeout_s", int(value)))
-        card.add(row(QLabel("同一画面停留超过多久算卡住并停止"), self.stuck_spin, None))
+        card.add(row(QLabel("同一画面停留超过多久算卡住并停止"), with_unit(self.stuck_spin, "秒"), None))
 
         self.end_switch = QPushButton("识别到「抽奖结束」界面时自动停止：开")
         self.end_switch.setCheckable(True)
@@ -497,11 +495,11 @@ class RhythmPage(PageBase):
         self.loop_delay = _spin(0)
         self.loop_delay.valueChanged.connect(
             lambda value: self.ctx.set("rhythm.loop_delay_ms", int(value)))
-        self.max_loops = _spin(0, 0, 1000000, 1, " 轮")
+        self.max_loops = _spin(0, 0, 1000000, 1)
         self.max_loops.valueChanged.connect(
             lambda value: self.ctx.set("rhythm.max_loops", int(value)))
-        card.add(row(QLabel("每轮结束后等待"), self.loop_delay,
-                     QLabel("最多循环"), self.max_loops, None))
+        card.add(row(QLabel("每轮结束后等待"), with_unit(self.loop_delay, "ms"),
+                     QLabel("最多循环"), with_unit(self.max_loops, "轮"), None))
         self.click_relative = QPushButton("点击坐标相对游戏窗口：开")
         self.click_relative.setCheckable(True)
         self.click_relative.setToolTip("开启后，点击步骤的坐标以游戏客户区左上角为原点，"
@@ -556,11 +554,17 @@ class RhythmPage(PageBase):
         key.setCurrentIndex(max(0, key.findData(current_key)))
         layout.addWidget(key)
 
-        hold = _spin(int(step.get("hold_ms", 45)), 8, 3000, 5, " ms 按住")
-        delay = _spin(int(step.get("delay_ms", 1000)), 0, 600000, 50, " ms 后继续")
+        hold = _spin(int(step.get("hold_ms", 45)), 8, 3000, 5)
+        delay = _spin(int(step.get("delay_ms", 1000)), 0, 600000, 50)
 
-        x_spin = _spin(int(step.get("x", 0)), 0, 20000, 10, " px")
-        y_spin = _spin(int(step.get("y", 0)), 0, 20000, 10, " px")
+        x_spin = _spin(int(step.get("x", 0)), 0, 20000, 10)
+        y_spin = _spin(int(step.get("y", 0)), 0, 20000, 10)
+
+        # 单位标签放在输入框外部（框内只留数字）
+        hold_box = with_unit(hold, "ms 按住")
+        delay_box = with_unit(delay, "ms 后继续")
+        x_box = with_unit(x_spin, "px")
+        y_box = with_unit(y_spin, "px")
 
         def _sync(*_args, i=index):
             steps = list(self.ctx.config.get("rhythm.steps", []) or [])
@@ -576,7 +580,7 @@ class RhythmPage(PageBase):
             }
             self.ctx.set("rhythm.steps", steps)
 
-        kind.currentIndexChanged.connect(lambda *_: (self._sync_visibility(kind, key, hold, x_spin, y_spin), _sync()))
+        kind.currentIndexChanged.connect(lambda *_: (self._sync_visibility(kind, key, hold_box, x_box, y_box), _sync()))
         key.currentIndexChanged.connect(_sync)
         hold.valueChanged.connect(_sync)
         delay.valueChanged.connect(_sync)
@@ -584,10 +588,10 @@ class RhythmPage(PageBase):
         y_spin.valueChanged.connect(_sync)
 
         layout.addWidget(key)
-        layout.addWidget(hold)
-        layout.addWidget(x_spin)
-        layout.addWidget(y_spin)
-        layout.addWidget(delay)
+        layout.addWidget(hold_box)
+        layout.addWidget(x_box)
+        layout.addWidget(y_box)
+        layout.addWidget(delay_box)
         layout.addStretch(1)
 
         up = QPushButton("↑")
@@ -604,18 +608,19 @@ class RhythmPage(PageBase):
         layout.addWidget(down)
         layout.addWidget(remove)
 
-        self._sync_visibility(kind, key, hold, x_spin, y_spin)
+        self._sync_visibility(kind, key, hold_box, x_box, y_box)
         holder.setProperty("row_index", index)
         return holder
 
     @staticmethod
-    def _sync_visibility(kind: QComboBox, key: QComboBox, hold: QSpinBox,
-                         x_spin: QSpinBox, y_spin: QSpinBox) -> None:
+    def _sync_visibility(kind: QComboBox, key: QComboBox, hold_box: QWidget,
+                         x_box: QWidget, y_box: QWidget) -> None:
+        """按步骤类型显隐对应输入框（传进来的是「数值框 + 单位标签」整块）。"""
         mode = kind.currentData()
         key.setVisible(mode == "key")
-        hold.setVisible(mode == "key")
-        x_spin.setVisible(mode == "click")
-        y_spin.setVisible(mode == "click")
+        hold_box.setVisible(mode == "key")
+        x_box.setVisible(mode == "click")
+        y_box.setVisible(mode == "click")
 
     # ------------------------------------------------------------------ #
     def _steps(self) -> list:

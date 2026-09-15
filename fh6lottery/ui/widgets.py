@@ -160,6 +160,25 @@ def hline() -> QFrame:
     return line
 
 
+def with_unit(spin: QWidget, unit: str) -> QWidget:
+    """数值控件 + 单位标签。
+
+    单位（ms / 秒 / 次 / px …）放在控件**外部**作为独立标签，
+    输入框内部只留半角数字 —— 见「UI 数值输入强制规则」第 3 条。
+    传入空字符串时原样返回控件本身。
+    """
+    unit = (unit or "").strip()
+    if not unit:
+        return spin
+    holder = QWidget()
+    layout = QHBoxLayout(holder)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(5)
+    layout.addWidget(spin)
+    layout.addWidget(muted(unit, wrap=False))
+    return holder
+
+
 def row(*widgets, spacing: int = 8, stretch_at_end: bool = False) -> QHBoxLayout:
     layout = QHBoxLayout()
     layout.setSpacing(spacing)

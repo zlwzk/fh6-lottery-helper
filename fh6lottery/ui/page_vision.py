@@ -15,15 +15,15 @@ from .. import capture, matcher, ocr as ocr_mod, winutil
 from ..templates import ROLE_ORDER, role_label
 from . import theme
 from .page_base import PageBase
-from .widgets import Card, ImageView, hint, hline, muted, numpy_to_qimage, row
+from .widgets import Card, ImageView, hint, hline, muted, numpy_to_qimage, row, with_unit
 
 
-def _spin(value: int, minimum: int, maximum: int, step: int, suffix: str) -> QSpinBox:
+def _spin(value: int, minimum: int, maximum: int, step: int) -> QSpinBox:
+    """数值输入框。单位由调用方用 ``with_unit()`` 加在框外。"""
     box = QSpinBox()
     box.setRange(minimum, maximum)
     box.setSingleStep(step)
     box.setValue(int(value))
-    box.setSuffix(suffix)
     box.setFixedWidth(120)
     return box
 
@@ -99,15 +99,15 @@ class RecogPage(PageBase):
         card.add(row(self.template_switch, self.ocr_switch, self.scale_switch, None))
 
         self.poll_spin = _spin(int(self.ctx.config.get("smart.poll_interval_ms", 220)),
-                               60, 2000, 20, " ms")
+                               60, 2000, 20)
         self.poll_spin.valueChanged.connect(
             lambda value: self.ctx.set("smart.poll_interval_ms", int(value)))
         self.ocr_interval_spin = _spin(int(self.ctx.config.get("smart.ocr_interval_ms", 900)),
-                                       200, 5000, 100, " ms")
+                                       200, 5000, 100)
         self.ocr_interval_spin.valueChanged.connect(
             lambda value: self.ctx.set("smart.ocr_interval_ms", int(value)))
-        card.add(row(QLabel("截图间隔"), self.poll_spin,
-                     QLabel("OCR 间隔"), self.ocr_interval_spin, None))
+        card.add(row(QLabel("截图间隔"), with_unit(self.poll_spin, "ms"),
+                     QLabel("OCR 间隔"), with_unit(self.ocr_interval_spin, "ms"), None))
         card.add(muted("截图间隔越小反应越快、越吃 CPU；OCR 比较慢，间隔别低于 0.6 秒。"))
         self.ocr_status = hint("")
         card.add(self.ocr_status)
